@@ -1,0 +1,213 @@
+buildscript {
+	repositories {
+		maven { name = 'MinecraftForge'; url = 'https://maven.minecraftforge.net/' }
+		maven { name = 'Sponge'; url = 'https://repo.spongepowered.org/repository/maven-public/' }
+		mavenCentral()
+	}
+	dependencies {
+		classpath group: 'net.minecraftforge.gradle', name: 'ForgeGradle', version: '6.0.+', changing: true
+		classpath group: 'org.spongepowered', name: 'mixingradle', version: "${mixingradle_version}"
+	}
+}
+
+plugins {
+	id 'eclipse'
+	id 'idea'
+	id 'maven-publish'
+}
+
+apply plugin: 'net.minecraftforge.gradle'
+apply plugin: 'org.spongepowered.mixin'
+
+version = "${mod_version}+mc${minecraft_version}"
+group = mod_group_id
+base { archivesName = mod_id }
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	withSourcesJar()
+}
+
+minecraft {
+	mappings channel: mapping_channel, version: mapping_version
+	copyIdeResources = true
+
+	runs {
+		client {
+			workingDirectory project.file('run')
+			property 'forge.logging.markers', ''
+			property 'forge.logging.console.level', 'debug'
+			property 'mixin.env.remapRefMap', 'true'
+			property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
+			mods {
+				"${mod_id}" {
+					source sourceSets.main
+				}
+			}
+		}
+		server {
+			workingDirectory project.file('run-server')
+			property 'forge.logging.markers', ''
+			property 'forge.logging.console.level', 'debug'
+			mods {
+				"${mod_id}" {
+					source sourceSets.main
+				}
+			}
+		}
+		data {
+			workingDirectory project.file('run-data')
+			property 'forge.logging.markers', ''
+			property 'forge.logging.console.level', 'debug'
+			args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+			mods {
+				"${mod_id}" {
+					source sourceSets.main
+				}
+			}
+		}
+	}
+}
+
+mixin {
+	// MixinGradle 0.7.38 predates ForgeGradle 6, so it never actually emits the refmap it is asked
+	// for (it looks for a `createSrgToMcp` output that FG6 renamed), and the mixin config here
+	// declares no refmap: the one mixin uses remap = false because JEI is a mod, not Minecraft, so
+	// none of its members need SRG remapping. MixinGradle stays applied because it wires the mixin
+	// annotation processor into the compile step.
+	config "${mod_id}.mixins.json"
+}
+
+repositories {
+	mavenCentral()
+	// JEI, and the libraries JEI itself depends on (mezz_config lives here too, and its artifacts
+	// are not on Maven Central). Do not narrow this with a content filter: `runClient` resolves
+	// JEI's transitive dependencies, and a filter that only allows mezz.jei makes them unresolvable.
+	maven {
+		name = 'BlameJared'
+		url = 'https://maven.blamejared.com/'
+	}
+	maven {
+		name = 'ParchmentMC'
+		url = 'https://maven.parchmentmc.org'
+		content {
+			includeGroup 'org.parchmentmc.data'
+		}
+	}
+}
+
+// The filter model (FilterOptions, FilterMode, ModEntry) is plain Java and is covered by JUnit
+// tests. They are run by `unitTest` rather than `test`, because ForgeGradle makes the stock `test`
+// task's classpath extend Forge's patched Minecraft, which is not a usable JUnit runtime.
+// `test` is pinned to `unitTest` so `gradlew build` verifies the model too.
+sourceSets {
+	unitTest {
+		// Deliberately not `src/test/java`: ForgeGradle's stock `test` source set cannot run here
+		// (its classpath extends Forge's patched Minecraft), so the tests live in their own set.
+		java.srcDir 'src/unitTest/java'
+		resources.srcDir 'src/unitTest/resources'
+		compileClasspath += sourceSets.main.output
+		runtimeClasspath += sourceSets.main.output
+	}
+}
+
+// Local tooling (a JDK 17 and the JUnit console launcher) lives in a `tools/` directory next to this
+// project, deliberately outside the repository so a checkout stays clean. This points at both
+// layouts: `<repo>/tools` and `<workspace>/tools`.
+def junitConsole = [
+	file('tools/libs/junit-platform-console-standalone-1.10.2.jar'),
+	file('../tools/libs/junit-platform-console-standalone-1.10.2.jar'),
+].find { it.isFile() }
+
+tasks.register('unitTest', JavaExec) {
+	group = 'verification'
+	description = 'Runs the pure-Java filter model tests. `gradlew test` is pinned to this task.'
+	dependsOn 'unitTestClasses'
+	classpath = sourceSets.unitTest.runtimeClasspath
+	mainClass = 'org.junit.platform.console.ConsoleLauncher'
+	args 'execute', '--class-path', sourceSets.unitTest.runtimeClasspath.asPath,
+		'--scan-class-path', sourceSets.unitTest.output.classesDirs.asPath,
+		'--details=tree', '--disable-ansi-colors'
+	doFirst {
+		if (junitConsole == null || !junitConsole.isFile()) {
+			throw new GradleException('junit-platform-console-standalone-1.10.2.jar not found. '
+				+ 'Download it into tools/libs/ (next to this project or next to the workspace).')
+		}
+	}
+}
+
+tasks.named('test', Test).configure {
+	// See above: the stock task cannot run here. `build` runs `check`, `check` runs `test`.
+	enabled = false
+	dependsOn 'unitTest'
+}
+
+dependencies {
+	minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+	// JEI: the mod we are an addon for.
+	//
+	// The API artifacts provide mezz.jei.api.*; the main artifact provides the GUI classes the
+	// mixin in com.jeifilter.mixin patches, and is also what `runClient` loads.
+	//
+	// JEI's published jar is SRG-named: its own members keep their mojmap names, but every call it
+	// makes into Minecraft uses an SRG name (e.g. `Minecraft.m_91087_()`). The dev jar is
+	// official-named (`Minecraft.getInstance()`), so the raw artifact dies with
+	// `NoSuchMethodError: net.minecraft.client.Minecraft.m_91087_()` while JEI is starting.
+	// `fg.deobf` is therefore mandatory on the runtime side, not just a convenience.
+	compileOnly "mezz.jei:jei-${minecraft_version}-common-api:${jei_version}"
+	compileOnly "mezz.jei:jei-${minecraft_version}-forge-api:${jei_version}"
+
+	def jeiForge = "mezz.jei:jei-${minecraft_version}-forge:${jei_version}"
+	// The deobfuscated jar already brings JEI's other modules with it, so the API jars above are
+	// enough on the compile side.
+	compileOnly(fg.deobf(jeiForge)) {
+		transitive = false
+	}
+	runtimeOnly fg.deobf(jeiForge)
+
+	annotationProcessor "org.spongepowered:mixin:${mixin_version}:processor"
+
+	unitTestImplementation platform('org.junit:junit-bom:5.10.2')
+	unitTestImplementation 'org.junit.jupiter:junit-jupiter'
+	unitTestImplementation 'org.junit.platform:junit-platform-console-standalone:1.10.2'
+	unitTestImplementation 'com.google.code.gson:gson:2.10.1'
+}
+
+tasks.named('processResources', ProcessResources).configure {
+	var replaceProperties = [
+		minecraft_version      : minecraft_version,
+		minecraft_version_range: minecraft_version_range,
+		forge_version          : forge_version,
+		forge_version_range    : forge_version_range,
+		loader_version_range   : loader_version_range,
+		mod_id                 : mod_id,
+		mod_name               : mod_name,
+		mod_license            : mod_license,
+		mod_version            : mod_version,
+		mod_authors            : mod_authors,
+		mod_description        : mod_description,
+		jei_version_range      : jei_version_range,
+	]
+	inputs.properties replaceProperties
+	filesMatching(['META-INF/mods.toml']) {
+		expand replaceProperties
+	}
+}
+
+jar {
+	manifest {
+		attributes([
+			'Specification-Title'     : mod_id,
+			'Specification-Vendor'    : mod_authors,
+			'Specification-Version'   : '1',
+			'Implementation-Title'    : project.name,
+			'Implementation-Version'  : project.jar.archiveVersion,
+			'Implementation-Vendor'   : mod_authors,
+			'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+			'MixinConfigs'            : "${mod_id}.mixins.json",
+		])
+	}
+}

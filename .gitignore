@@ -1,0 +1,29 @@
+# Gradle / build output
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local run directory (dev client world, logs, crash reports)
+run/
+run-data/
+run-server/
+
+# Local tooling: JDK 17 and the JUnit console launcher live outside the repo; never commit them.
+tools/
+*.zip
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.eclipse/
+.settings/
+.classpath
+.project
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
