@@ -2,7 +2,7 @@
 
 A client-side addon for [Just Enough Items](https://github.com/mezz/JustEnoughItems) on **Minecraft 1.20.1 / Forge**.
 It adds a **hopper button to the left edge of JEI's search bar**. Clicking it opens a menu where you tick
-mods to hide their items and recipes from JEI, with both **positive selection (show only checked)** and
+mods to hide everything they register from JEI, with both **positive selection (show only checked)** and
 **negative selection (hide checked)**.
 
 ## What it looks like
@@ -19,8 +19,9 @@ mods to hide their items and recipes from JEI, with both **positive selection (s
 └────────────────────────────────────────────────┘
 ```
 
-The hopper is tinted **green** whenever a filter is active, so you can tell at a glance that JEI is
-hiding something. Hovering it shows the tooltip with the number of hidden mods and items.
+While a filter is active a **green dot** is drawn in the button's bottom-right corner, so you can tell
+at a glance that JEI is hiding something. Hovering it shows the tooltip with the number of hidden mods
+and ingredients.
 
 ## The filter menu
 
@@ -88,15 +89,20 @@ Delete that file (or untick everything) to get back to a stock JEI.
   tooltip switches to `Filtering N mods (M items hidden)`.
 - **A partial ingredient list is never applied.** Ingredient lookups do not have a "finished
   loading" signal, so `rebuildCatalog` refuses a catalog that is missing mods the previous one had.
+  This matters in whitelist mode, where "not in the catalog" would otherwise mean "hidden" and mods
+  could flicker out and back in while JEI is still loading.
 - **On JEI older than 15.55.0 the catalog is never re-read while a filter is active.** That route
   hides by taking ingredients *out* of JEI's list, so re-reading it would return the filtered list,
   conclude the hidden mods are simply absent, and unhide them again — the "the items came back after
   a moment" bug. There, an ingredient change only marks the catalog stale, and it is re-read at a
   deliberate moment (opening the menu, or changing the selection) through `refreshCatalogNow`, which
-  un-hides first so the list is complete while it is read. On JEI 15.55.0+ hiding is a visibility
-  flag, `getAllIngredients` still returns everything, and the catalog can simply be rebuilt.
-  This matters in whitelist mode, where "not in the catalog" would otherwise mean "hidden" and mods
-  could flicker out and back in while JEI is still loading.
+  un-hides first so the list is complete while it is read, and refuses a catalog that shrank. On JEI
+  15.55.0+ hiding is a visibility flag, `getAllIngredients` still returns everything, and the catalog
+  can simply be rebuilt.
+- **Visibility changes and catalog re-reads are mutually exclusive.** `refreshCatalogNow` holds the
+  same guard as `applyNow` for its whole "un-hide, re-read, re-hide" sequence. Without that, a menu
+  open could rebuild the catalog from a half-hidden list and the hidden set would be recomputed from
+  whatever was left, which is what made items reappear and then disappear again.
 - **`applyNow` is re-entrancy guarded.** `removeIngredientsAtRuntime`/`addIngredientsAtRuntime`
   notify ingredient listeners synchronously, and this mod is one of them, so without the guard
   `applyNow → addIngredientsAtRuntime → onIngredientsAdded → refreshFromIngredients → applyNow`
@@ -132,8 +138,8 @@ last line ForgeGradle 6 runs cleanly on.
 Useful tasks:
 
 ```
-gradlew.bat build          # compile + mixin annotation processing + jar
-gradlew.bat unitTest       # JUnit tests for the filter model (20 tests)
+gradlew.bat build          # compile + mixin annotation processing + jar + tests
+gradlew.bat unitTest       # JUnit tests only (37 tests)
 gradlew.bat runClient      # dev client with JEI loaded
 gradlew.bat runServer      # dev server; JEI Filter is client-only and does nothing here
 ```
@@ -165,7 +171,8 @@ start `logs/latest.log` contains:
 JEI Filter is loading (client side = true)
 ...
 jei_filter: hopper filter button created for the JEI search bar
-jei_filter: JEI exposes <n> ingredients from <m> mods
+jei_filter: JEI exposes <ingredients> ingredients from <mods> mods across <types> ingredient type(s)
+jei_filter: hiding <mods> mods (<ingredients> ingredients) from JEI
 ```
 
 and `logs/debug.log` contains one `Mixing ...` line per mixin:
@@ -175,97 +182,132 @@ Mixing IngredientListOverlayMixin from jei_filter.mixins.json into mezz.jei.gui.
 Mixing GuiTextFieldFilterAccessor from jei_filter.mixins.json into mezz.jei.gui.input.GuiTextFieldFilter
 ```
 
-Two more lines confirm the filter itself reached JEI. Which pair you see depends on the JEI version,
-because `JeiVisibilityBridge` picks the API that exists:
+When you tick something, JEI itself confirms which API was used — the pair you see depends on the
+JEI version, because `JeiVisibilityBridge` picks the one that exists:
 
 ```
-jei_filter: hopper pressed at (x, y); opening the mod filter screen            (debug level)
-
 JEI 15.55.0+:
   Ingredients are being hidden at runtime in [Ingredient, Recipe]: <n> net.minecraft.world.item.ItemStack
 
-older JEI:
+JEI older than 15.55.0:
   jei_filter: this JEI has no hideIngredients/unhideIngredients (added in JEI 15.55.0); falling back
   Ingredients are being removed at runtime: <n> net.minecraft.world.item.ItemStack
+  Ingredients are being removed at runtime: <n> net.minecraftforge.fluids.FluidStack
 ```
+
+One line per ingredient type is expected: hiding covers items, fluids and any other registered type.
 
 ### Verification status
 
-Verified in a live dev client on Forge 47.4.23, by driving the game and reading the logs it wrote.
+Verified by launching the dev client on Forge 47.4.23 and driving the game, reading the logs it wrote.
 
-On **JEI 15.62.0.217** (the `hideIngredients` path):
+On **JEI 15.62.0.217**:
 
-- JEI loads; both mixins apply to the real classes; the hopper renders at the left of JEI's search
-  bar with a working tooltip.
-- Clicking the hopper opens the menu.
-- In the default "hide checked" mode, ticking `Minecraft` makes JEI hide all 1559 of its item
-  ingredients and the overlay's grid empties; unticking brings them back. JEI's own log confirms the
-  direction: `Ingredients are being hidden ...` on the tick and `Ingredients are being unhidden ...`
-  on the untick.
+- Both mixins apply to the real classes; the hopper renders at the left of JEI's search bar with a
+  working tooltip; clicking it opens the menu.
+- In the default "hide checked" mode, ticking `Minecraft` hides all 1559 of its item ingredients and
+  the overlay's grid empties; unticking brings them back. JEI's own log confirms the direction
+  (`hidden` on the tick, `unhidden` on the untick).
 - The "filter is active" dot is visible (measured `max(G−R)` of 6 inactive vs 170 active in the
   button's corner) and the tooltip switches to `Filtering N mods (M items hidden)`.
 - The selection persists to `config/jei_filter.json` and is read back on the next start.
 
-On **JEI 15.20.0.129** (the `removeIngredientsAtRuntime` path, i.e. an older pack):
+On **JEI 15.20.0.129** (an older pack — the `removeIngredientsAtRuntime` route):
 
-- Both mixins still apply; JEI loads the mod; the button is created; the catalog is read once.
-- The bridge logs that it fell back, and a filter preselected in `config/jei_filter.json` produces
-  `Ingredients are being removed at runtime: N net.minecraft.world.item.ItemStack` **and**
-  `... 2 net.minecraftforge.fluids.FluidStack` — i.e. every ingredient type is covered, which is the
-  fix for fluids and other non-item ingredients staying visible.
-- No recursion and no crash. This path used to recurse until `StackOverflowError` because
-  `addIngredientsAtRuntime` re-enters this mod's own ingredient listener; that is what the
-  `applyingVisibility` guard in `applyNow`/`refreshFromIngredients` fixes.
-- A filter survives the ingredient-list changes that the hide itself causes, instead of the hidden
-  items being added back seconds later. That was the "other mods' items reappear" bug, and it is why
-  this route marks the catalog stale instead of rebuilding it.
+- Both mixins still apply, the mod loads, the button is created, and the catalog is read once.
+- Hiding covers **every ingredient type**: a filter produces
+  `Ingredients are being removed at runtime: 1556 ... ItemStack` **and**
+  `... 2 ... FluidStack`.
+- Items stay hidden. Verified by asking JEI what it is currently showing after a hide:
+  `catalogHas=1556` against `jeiShows=0`, then `jeiShows=1556` again after unticking.
+- No recursion, no crash, and nothing is added back seconds later.
 
-Not yet verified on 15.20 by the author: opening the menu by clicking, and that the grid visually
-empties (the dev instance for that check loads a single mod, so it was exercised on 15.62 instead).
-Reported working in a 324-mod pack by the user, which is where the multi-mod behaviour was observed.
+Reported working by the user in a **324-mod pack** on JEI 15.20.0.129, whitelist mode with only
+`minecraft` ticked: modded potions, potion arrows, enchanted books and fluids are all gone.
 
-Known gaps:
+### Not covered by the checks above
 
-- A mod is only filterable if JEI reports a resource location for its ingredients. An ingredient
-  built by JEI itself, with no mod namespace, is attributed to `jei` rather than dropped.
-- Whitelist mode with nothing ticked hides everything including vanilla. There is no
-  "you are about to hide everything" confirmation.
-- On JEI older than 15.55.0, hiding affects the ingredient list but not recipe slots/catalysts.
-- On that same older JEI, applying a filter makes JEI log a remove/add pair per ingredient type per
-  application, because `removeIngredientsAtRuntime`/`addIngredientsAtRuntime` is the only public
+- The **JEI 15.55.0+ hiding path has not been exercised since the attribution fix**. It is the same
+  decision code feeding a different call, and it worked before that change, but the exact build
+  shipped here was only run end to end on JEI 15.20. If you are on 15.55+, the equivalent check is
+  that ticking a mod logs `Ingredients are being hidden at runtime in [Ingredient, Recipe]` for each
+  ingredient type, and that unticking logs the `unhidden` counterpart.
+- Recipe-slot and catalyst hiding (`UidContext.Recipe`) only exists on 15.55.0+; on older JEI the
+  ingredient list is what is filtered.
+
+### Known gaps
+
+- A mod is only filterable if JEI can attribute its ingredients to it. An ingredient that reports
+  neither a creator mod id nor a registry namespace is skipped entirely; one that reports only
+  `minecraft` (a vanilla item) stays with `minecraft`.
+- Whitelist mode with nothing ticked hides everything, including vanilla. There is no "you are about
+  to hide everything" confirmation.
+- On JEI older than 15.55.0, applying a filter makes JEI log a remove/add pair per ingredient type
+  per application, because `removeIngredientsAtRuntime`/`addIngredientsAtRuntime` is the only public
   route there.
 
 ## Project layout
 
 ```
 src/main/java/com/jeifilter/
-  JeiFilterMod.java              mod entry point, config directory
+  JeiFilterMod.java              mod entry point; registers the screen-level click hook
   jei/JeiFilterPlugin.java       IModPlugin: JEI runtime available / unavailable
-  jei/JeiFilterService.java      filter state, mod catalog, hide/unhide driver, persistence
+  jei/JeiFilterService.java      filter state, catalog, hide/unhide driver, persistence
+  jei/ModCatalog.java            every ingredient of every type, grouped by mod
   jei/JeiVisibilityBridge.java   picks hideIngredients (15.55+) or removeIngredientsAtRuntime
   filter/ModAttribution.java     creator-mod-id first, registry namespace as the fallback
   filter/FilterOptions.java      immutable selection + mode, JSON round trip, hide/unhide plan
   filter/FilterMode.java         blacklist / whitelist
-  filter/ModEntry.java           one row of the menu
-  client/JeiFilterButton.java    the hopper button
+  filter/ModEntry.java           one row of the menu, and its sort orders
+  client/JeiFilterButton.java    the hopper button and its "filter is active" dot
   client/JeiFilterInputEvents.java  screen-level click hook for the hopper
-  client/gui/ModFilterScreen.java the menu
+  client/gui/ModFilterScreen.java   the menu
   mixin/IngredientListOverlayMixin.java   search bar layout, draw, tooltip
   mixin/GuiTextFieldFilterAccessor.java   reads JEI's search field bounds
-src/unitTest/java/com/jeifilter/filter/   JUnit tests for the filter model
 src/main/resources/
   META-INF/mods.toml             mod metadata
   jei_filter.mixins.json         mixin config
   assets/jei_filter/lang/        en_us + zh_cn
+  jei_filter.png                 mod logo
+src/unitTest/java/com/jeifilter/filter/
+  FilterOptionsTest.java         selection, mode, JSON round trip
+  FilterPlanTest.java            which mods get hidden vs unhidden
+  ModAttributionTest.java        creator mod id vs registry namespace
+  ModEntryTest.java              search matching and sort orders
 ```
 
 ## Limitations
 
-- Only **item** ingredients are filtered. Fluid and other ingredient types registered by other mods
-  are not part of this filter; a hidden mod's items simply stop appearing in recipe slots.
-- The ingredient list is a snapshot taken when JEI becomes available and refreshed when JEI reports
-  ingredient changes, so a mod that adds items at runtime appears in the menu after that refresh.
-- Hiding `jei` itself is allowed and hides JEI's own items (its lookup history etc. is unaffected).
+- **Client only.** Nothing happens on a dedicated server; the mod is not needed there.
+- Hiding is by **mod**, not by individual ingredient. To hide a single item, use JEI's own
+  hide-item feature.
+- A mod only appears in the menu once JEI is reporting ingredients for it, which happens when a world
+  is loaded. The menu is empty on the title screen.
+- Hiding `jei` itself is allowed; it hides JEI's own items. JEI's lookup history is unaffected.
+- Changing the selection makes JEI remove or re-add ingredients, so on older JEI a large filter
+  change is visible for a moment as the list re-populates.
+
+## Development notes
+
+Five defects in this mod were only findable in a large pack, not in the single-mod dev instance.
+They are recorded here because each one is a trap worth recognising again:
+
+| Symptom | Cause |
+|---|---|
+| Modded potions, potion arrows, enchanted books survive "hide minecraft" | Attribution used the registry namespace. A modded potion is `minecraft:potion`; only the creator-mod-id lookup names the mod that added it. |
+| Fluids survive "hide everything" | Only `VanillaTypes.ITEM_STACK` was filtered. JEI's fluid ingredients are a separate registered type. |
+| `StackOverflowError` on an older JEI | `removeIngredientsAtRuntime`/`addIngredientsAtRuntime` notify ingredient listeners synchronously, and this mod is one. |
+| Hidden items reappear seconds later on an older JEI | The catalog was re-read while the filter was applied, so it returned the *filtered* list and the hidden mods looked absent. |
+| Items reappear, then disappear again | A menu open rebuilt the catalog in the middle of a hide, so the hidden set was recomputed from a half-applied state. |
+
+Two lessons that generalise:
+
+- **A hide that "ran" is not a hide that "took".** On the older JEI route the ingredient list is the
+  thing being modified, so reading it back after hiding returns the filtered list. The useful
+  assertion in a live client is `IIngredientManager#getAllItemStacks().size()` after a hide, not
+  whether a hide call was issued.
+- **Attribution errors are invisible in small dev instances** and obvious in a large pack, because
+  they only show up for ingredients whose registry name disagrees with the mod that added them.
 
 ## License
 
