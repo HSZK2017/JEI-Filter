@@ -26,8 +26,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.jeifilter.JeiFilterMod;
 import com.jeifilter.client.JeiFilterButton;
-import com.jeifilter.filter.FilterMode;
 import com.jeifilter.filter.FilterOptions;
+import com.jeifilter.filter.IngredientCategory;
 import com.jeifilter.filter.ModEntry;
 import com.mojang.logging.LogUtils;
 
@@ -66,8 +66,8 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 	/** Everything JEI is showing, grouped by mod, across every registered ingredient type. */
 	private ModCatalog catalog = ModCatalog.EMPTY;
 
-	/** The mod ids this mod is currently hiding from JEI. */
-	private Set<String> hiddenModIds = Set.of();
+	/** The ingredients this mod hid from JEI, so the next apply knows what to put back. */
+	private Set<FilterOptions.IngredientKey> hiddenIngredients = Set.of();
 	/** True while this mod is itself telling JEI to hide or show ingredients. */
 	private boolean applyingVisibility;
 	/**
@@ -80,6 +80,8 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 
 	private Path configFile;
 	private FilterOptions options = FilterOptions.EMPTY;
+	/** Mods whose facets this build has already accounted for, so only new ones get ticked. */
+	private Set<String> seenModIds = Set.of();
 
 	private JeiFilterService() {
 	}
@@ -104,12 +106,15 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		boolean sameRuntime = this.runtime == runtime;
 		this.runtime = runtime;
 		if (!sameRuntime) {
-			this.hiddenModIds = Set.of();
+			this.hiddenIngredients = Set.of();
 			this.catalog = ModCatalog.EMPTY;
 		}
 		this.catalogStale = false;
 		this.configFile = configDir.resolve(FILE_NAME);
 		this.options = loadOptions();
+		// A facet for a mod this build has never seen starts ticked. Without that, a mod that loads
+		// later than the saved config would be hidden the instant it appeared in blacklist mode.
+		this.seenModIds = Set.of();
 
 		IIngredientManager ingredientManager = runtime.getIngredientManager();
 		ingredientManager.registerIngredientListener(this);
@@ -123,6 +128,20 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 
 		rebuildCatalog(ingredientManager, runtime.getJeiHelpers().getModIdHelper());
 		applyNow();
+		logCategoryBreakdown();
+	}
+
+	/** Reports what the category rules found, so a wrong rule is visible instead of silent. */
+	private void logCategoryBreakdown() {
+		for (IngredientCategory category : IngredientCategory.SELECTABLE) {
+			int mods = this.catalog.modCountOf(category);
+			if (mods > 0) {
+				LOGGER.info("jei_filter: category {}: {} ingredients across {} mods",
+					category.id(), this.catalog.totalCountOf(category), mods);
+			}
+		}
+		int uncategorised = this.catalog.totalCountOf(IngredientCategory.MAIN);
+		LOGGER.info("jei_filter: {} ingredients are in no special category", uncategorised);
 	}
 
 	public void onRuntimeUnavailable() {
@@ -130,7 +149,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		this.runtime = null;
 		this.visibilityBridge = null;
 		this.ready = false;
-		this.hiddenModIds = Set.of();
+		this.hiddenIngredients = Set.of();
 		this.catalogStale = false;
 	}
 
@@ -153,34 +172,85 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		return this.catalog.entries();
 	}
 
-	/** The number of mods that are currently hidden from JEI. */
-	public int hiddenModCount() {
-		return this.hiddenModIds.size();
-	}
-
 	/** The number of ingredients currently hidden from JEI, across every ingredient type. */
 	public int hiddenIngredientCount() {
-		return countIngredients(this.hiddenModIds);
+		return this.hiddenIngredients.size();
 	}
 
-	private int countIngredients(Collection<String> modIds) {
-		int total = 0;
-		for (List<Object> ingredients : this.catalog.ingredientsOf(modIds).values()) {
-			total += ingredients.size();
+	public Set<FilterOptions.IngredientKey> hiddenIngredients() {
+		return this.hiddenIngredients;
+	}
+
+	/** How many loaded mods are currently ticked, for the footer. */
+	public int tickedModCount() {
+		int ticked = 0;
+		for (String modId : this.catalog.loadedModIds()) {
+			if (this.options.isModTicked(modId)) {
+				ticked++;
+			}
 		}
-		return total;
-	}
-
-	public Set<String> hiddenModIds() {
-		return this.hiddenModIds;
+		return ticked;
 	}
 
 	public boolean isFilterActive() {
-		return !this.hiddenModIds.isEmpty();
+		return !this.hiddenIngredients.isEmpty();
 	}
 
 	public Optional<IJeiRuntime> runtime() {
 		return Optional.ofNullable(this.runtime);
+	}
+
+	// ------------------------------------------------------------------
+	// queries used by the menu
+	// ------------------------------------------------------------------
+
+	/** Every category that at least one loaded mod has ingredients in. */
+	public List<IngredientCategory> visibleCategories() {
+		return IngredientCategory.SELECTABLE.stream()
+			.filter(category -> this.catalog.modCountOf(category) > 0)
+			.toList();
+	}
+
+	/** The tick state of a category row: all mods show it, none do, or only some. */
+	public FilterOptions.TickState categoryState(IngredientCategory category) {
+		return this.options.categoryState(category, this.catalog.modsWith(category));
+	}
+
+	public int categoryModCount(IngredientCategory category) {
+		return this.catalog.modCountOf(category);
+	}
+
+	public int categoryIngredientCount(IngredientCategory category) {
+		return this.catalog.totalCountOf(category);
+	}
+
+	/** The tick state of a mod's row: everything, nothing, or only some categories. */
+	public FilterOptions.TickState modState(String modId) {
+		return this.options.modState(modId, this.catalog.categoriesOf(modId));
+	}
+
+	/** The categories to list under a mod's row, in display order. */
+	public List<IngredientCategory> categoriesOf(String modId) {
+		Set<IngredientCategory> present = this.catalog.categoriesOf(modId);
+		List<IngredientCategory> ordered = new ArrayList<>(present.size());
+		for (IngredientCategory category : IngredientCategory.SELECTABLE) {
+			if (present.contains(category)) {
+				ordered.add(category);
+			}
+		}
+		if (present.contains(IngredientCategory.MAIN)) {
+			ordered.add(IngredientCategory.MAIN);
+		}
+		return ordered;
+	}
+
+	/** Whether anything of this mod's category would currently be visible. */
+	public boolean isCategoryVisible(String modId, IngredientCategory category) {
+		return this.options.isCategoryVisible(modId, category);
+	}
+
+	public int countOf(String modId, IngredientCategory category) {
+		return this.catalog.countOf(modId, category);
 	}
 
 	// ------------------------------------------------------------------
@@ -200,20 +270,31 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		saveOptions();
 	}
 
-	public void toggleMod(String modId) {
-		setOptions(this.options.withToggled(modId));
+	/** Ticks or unticks a whole mod. Ticking it clears its per-category boxes, so it is the one showing them. */
+	public void setModTicked(String modId, boolean ticked) {
+		setOptions(this.options.withModTicked(modId, ticked, this.catalog.categoriesOf(modId)));
 	}
 
-	public void setSelected(Collection<String> modIds, boolean selected) {
-		setOptions(this.options.withSelection(modIds, selected));
+	/** Ticks or unticks one mod's category — the sub-checkbox on a mod row. */
+	public void setCategoryTicked(String modId, IngredientCategory category, boolean ticked) {
+		setOptions(this.options.withCategoryTicked(modId, category, ticked));
+	}
+
+	/**
+	 * Ticks or unticks one category on every mod that has it — the master checkbox on a category row.
+	 * Each affected mod's sub-checkbox follows, which is the sync the menu promises.
+	 */
+	public void setCategoryTickedEverywhere(IngredientCategory category, boolean ticked) {
+		setOptions(this.options.withCategoryTickedEverywhere(category, this.catalog.modsWith(category), ticked));
+	}
+
+	/** Ticks or unticks many mods as whole mods, which is what the All / None buttons do. */
+	public void setModsTicked(Collection<String> modIds, boolean ticked) {
+		setOptions(this.options.withModsTicked(modIds, visibleCategories(), ticked));
 	}
 
 	public void invertSelection(Collection<String> modIds) {
-		setOptions(this.options.withInvertedSelection(modIds));
-	}
-
-	public void setMode(FilterMode mode) {
-		setOptions(this.options.withMode(mode));
+		setOptions(this.options.withInverted(modIds, visibleCategories()));
 	}
 
 	// ------------------------------------------------------------------
@@ -253,9 +334,9 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		// On a JEI whose hiding takes ingredients out of the list it reports, a catalog read while a
 		// filter is active is a filtered catalog. A shrunken one is therefore almost certainly an
 		// artefact of reading at the wrong moment, not a mod the player removed, and replacing the
-		// good catalog with it would lose track of which mods are currently hidden.
+		// good catalog with it would lose track of which ingredients are currently hidden.
 		boolean hidesByRemoval = this.visibilityBridge != null && !this.visibilityBridge.hidesRecipeSlots();
-		if (hidesByRemoval && !this.hiddenModIds.isEmpty()
+		if (hidesByRemoval && !this.hiddenIngredients.isEmpty()
 			&& rebuilt.loadedModIds().size() < previous.size()) {
 			LOGGER.warn("jei_filter: refusing a catalog of {} mods while filtering with a previous catalog of {}; "
 					+ "it was read while ingredients were hidden",
@@ -265,6 +346,16 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 
 		this.catalog = rebuilt;
 		this.ready = true;
+
+		// Tick the facets of any mod that has not been seen before, so a mod that loads later is not
+		// hidden the moment it appears. Done here, before the caller applies, so the very first apply
+		// already has it.
+		FilterOptions withNewMods = this.options.withNewModsTicked(this.seenModIds, rebuilt.loadedModIds());
+		if (!withNewMods.equals(this.options)) {
+			this.options = withNewMods;
+			saveOptions();
+		}
+		this.seenModIds = rebuilt.loadedModIds();
 		return true;
 	}
 
@@ -277,7 +368,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 			return;
 		}
 
-		FilterOptions.FilterPlan plan = this.options.plan(this.hiddenModIds, this.catalog.loadedModIds());
+		FilterOptions.IngredientPlan plan = this.options.plan(this.hiddenIngredients, this.catalog.ingredientIndex());
 
 		// The legacy JEI route (addIngredientsAtRuntime / removeIngredientsAtRuntime) notifies
 		// ingredient listeners synchronously, and this mod is one of them, so without this guard
@@ -286,28 +377,16 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		// treated as news about JEI's ingredient list.
 		this.applyingVisibility = true;
 		try {
-			// Unhide first, then hide. The decision of which mods go where lives in FilterOptions#plan
-			// so it is covered by unit tests; getting the sense of these two calls backwards produces
-			// a filter that does the opposite of its label.
-			applyVisibility(bridge, plan.modsToUnhide(), true);
-			applyVisibility(bridge, plan.modsToHide(), false);
+			// Unhide first, then hide. The decision of which ingredients go where lives in
+			// FilterOptions#plan so it is covered by unit tests; getting the sense of these two calls
+			// backwards produces a filter that does exactly the opposite of its label.
+			bridge.setVisible(this.catalog.ingredientsFor(plan.toUnhide()), true);
+			bridge.setVisible(this.catalog.ingredientsFor(plan.toHide()), false);
 		} finally {
 			this.applyingVisibility = false;
 		}
-		this.hiddenModIds = plan.newHiddenSet();
-		LOGGER.info("jei_filter: hiding {} mods ({} ingredients) from JEI", this.hiddenModIds.size(),
-			countIngredients(this.hiddenModIds));
-	}
-
-	/**
-	 * Hands JEI every ingredient of the named mods — items, fluids, and anything another mod
-	 * registered as its own ingredient type — and asks it to hide or show them.
-	 */
-	private void applyVisibility(JeiVisibilityBridge bridge, Set<String> modIds, boolean visible) {
-		if (modIds.isEmpty()) {
-			return;
-		}
-		bridge.setVisible(this.catalog.ingredientsOf(modIds), visible);
+		this.hiddenIngredients = plan.newHiddenSet();
+		LOGGER.info("jei_filter: hiding {} ingredients from JEI", this.hiddenIngredients.size());
 	}
 
 	// ------------------------------------------------------------------
@@ -380,7 +459,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 	 * <p>The whole sequence holds {@code applyingVisibility}, which makes it atomic with respect to
 	 * {@link #applyNow} and to itself. That matters: this method both un-hides and re-hides, and if
 	 * an {@code applyNow} could interleave with it, the bookkeeping would be updated against a
-	 * half-applied state and the filter would end up hiding the wrong mods.
+	 * half-applied state and the filter would end up hiding the wrong ingredients.
 	 *
 	 * @return true if the catalog was rebuilt
 	 */
@@ -393,11 +472,11 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 
 		this.applyingVisibility = true;
 		try {
-			if (!this.hiddenModIds.isEmpty()) {
+			if (!this.hiddenIngredients.isEmpty()) {
 				LOGGER.info("jei_filter: re-reading JEI's ingredients ({})", reason);
 				// Take our own hides back off first, so JEI's list is complete again while we read it.
-				bridge.setVisible(this.catalog.ingredientsOf(this.hiddenModIds), true);
-				this.hiddenModIds = Set.of();
+				bridge.setVisible(this.catalog.ingredientsFor(this.hiddenIngredients), true);
+				this.hiddenIngredients = Set.of();
 			}
 
 			if (!rebuildCatalog(currentRuntime.getIngredientManager(),
@@ -443,7 +522,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 				Files.createDirectories(parent);
 			}
 			JsonObject root = new JsonObject();
-			root.addProperty("_comment", "Mods checked in JEI's filter button menu, and what checked means.");
+			root.addProperty("_comment", "Ticked facets: a mod id shows that whole mod, mod|category shows one kind of item. Listed under unticked are individual categories turned off.");
 			root.add("options", this.options.toJson());
 			try (Writer writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
 				GSON.toJson(root, writer);

@@ -12,6 +12,8 @@ import java.util.TreeMap;
 
 import org.slf4j.Logger;
 
+import com.jeifilter.filter.FilterOptions;
+import com.jeifilter.filter.IngredientCategory;
 import com.jeifilter.filter.ModAttribution;
 import com.jeifilter.filter.ModEntry;
 import com.mojang.logging.LogUtils;
@@ -19,20 +21,24 @@ import com.mojang.logging.LogUtils;
 import mezz.jei.api.helpers.IModIdHelper;
 import mezz.jei.api.ingredients.IIngredientHelper;
 import mezz.jei.api.ingredients.IIngredientType;
+import mezz.jei.api.ingredients.subtypes.UidContext;
 import mezz.jei.api.runtime.IIngredientManager;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.ItemStack;
+import net.minecraftforge.registries.ForgeRegistries;
 
 /**
- * A snapshot of everything JEI is showing, grouped by the mod that registered it.
+ * A snapshot of everything JEI is showing, grouped by the mod that added it and by what kind of
+ * thing it is.
  *
- * <p>JEI's ingredient list is not just items: fluids, and anything another mod registers as its own
- * {@link IIngredientType}, are separate types with their own helpers. Filtering "hide this mod"
- * therefore has to walk every registered type, not just {@code VanillaTypes.ITEM_STACK} — otherwise
- * a hidden mod's fluids and custom ingredients stay on screen and in whitelist mode a fully hidden
- * pack still shows fluids.
+ * <p>Two axes, both needed. JEI's ingredient list is not just items: fluids, and anything another
+ * mod registers as its own {@link IIngredientType}, are separate types with their own helpers, so
+ * hiding "this mod" has to walk every registered type or a hidden mod's fluids stay on screen. And
+ * within a mod, the player may want only part of it — every potion but nothing else — which is what
+ * {@link IngredientCategory} is for.
  *
- * <p>The mod id for an ingredient comes from the namespace of its
- * {@link IIngredientHelper#getResourceLocation(Object) registry name}, which every ingredient type
- * has to provide. The display name comes from JEI's {@link IModIdHelper}.
+ * <p>The mod id for an ingredient comes from {@link ModAttribution}, which follows JEI: creator mod
+ * id first, registry namespace as the fallback. The category comes from the item's registry path.
  *
  * <p>Immutable. Built once from the ingredient manager and replaced wholesale on a rebuild.
  */
@@ -40,34 +46,48 @@ final class ModCatalog {
 	private static final Logger LOGGER = LogUtils.getLogger();
 
 	/** The empty catalog, used before JEI has reported any ingredients. */
-	static final ModCatalog EMPTY = new ModCatalog(Map.of(), List.of(), Set.of());
+	static final ModCatalog EMPTY = new ModCatalog(Map.of(), List.of(), Set.of(), Map.of(), Map.of(), Map.of());
 
-	/** modId -> the ingredients of that mod, per ingredient type. */
-	private final Map<String, Map<IIngredientType<?>, List<Object>>> byMod;
+	/** modId -> category -> ingredient type -> the ingredients. */
+	private final Map<String, Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>>> byMod;
 	private final List<ModEntry> entries;
 	private final Set<String> loadedModIds;
+	/** modId -> category -> how many ingredients. */
+	private final Map<String, Map<IngredientCategory, Integer>> counts;
+	/** Every ingredient's placement, keyed the way JEI identifies it. */
+	private final Map<FilterOptions.IngredientKey, FilterOptions.IngredientInfo> ingredientIndex;
+	/** The reverse of the index, so a key can be turned back into an ingredient for JEI. */
+	private final Map<FilterOptions.IngredientKey, Map.Entry<IIngredientType<?>, Object>> byKey;
 
-	private ModCatalog(Map<String, Map<IIngredientType<?>, List<Object>>> byMod,
+	private ModCatalog(Map<String, Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>>> byMod,
 					   List<ModEntry> entries,
-					   Set<String> loadedModIds) {
+					   Set<String> loadedModIds,
+					   Map<String, Map<IngredientCategory, Integer>> counts,
+					   Map<FilterOptions.IngredientKey, FilterOptions.IngredientInfo> ingredientIndex,
+					   Map<FilterOptions.IngredientKey, Map.Entry<IIngredientType<?>, Object>> byKey) {
 		this.byMod = byMod;
 		this.entries = entries;
 		this.loadedModIds = loadedModIds;
+		this.counts = counts;
+		this.ingredientIndex = ingredientIndex;
+		this.byKey = byKey;
 	}
 
 	/**
-	 * Reads every ingredient of every registered type out of JEI and groups it by mod.
+	 * Reads every ingredient of every registered type out of JEI and groups it by mod and category.
 	 *
-	 * @return the catalog, or {@link #EMPTY} if JEI has not reported its ingredients yet
+	 * @return the catalog, or {@link EMPTY} if JEI has not reported its ingredients yet
 	 */
 	static ModCatalog build(IIngredientManager ingredientManager, IModIdHelper modIdHelper) {
-		Map<String, Map<IIngredientType<?>, List<Object>>> byMod = new TreeMap<>();
-		Map<String, Map<IIngredientType<?>, Integer>> countsByMod = new TreeMap<>();
+		Map<String, Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>>> byMod = new TreeMap<>();
+		Map<String, Map<IngredientCategory, Integer>> counts = new TreeMap<>();
+		Map<FilterOptions.IngredientKey, FilterOptions.IngredientInfo> index = new LinkedHashMap<>();
+		Map<FilterOptions.IngredientKey, Map.Entry<IIngredientType<?>, Object>> byKey = new LinkedHashMap<>();
 		int total = 0;
 		int skippedTypes = 0;
 
 		for (IIngredientType<?> type : ingredientManager.getRegisteredIngredientTypes()) {
-			int forType = collectType(ingredientManager, type, byMod, countsByMod);
+			int forType = collectType(ingredientManager, type, byMod, counts, index, byKey);
 			if (forType < 0) {
 				skippedTypes++;
 			} else {
@@ -81,7 +101,7 @@ final class ModCatalog {
 		}
 
 		List<ModEntry> entries = new ArrayList<>(byMod.size());
-		for (Map.Entry<String, Map<IIngredientType<?>, Integer>> entry : countsByMod.entrySet()) {
+		for (Map.Entry<String, Map<IngredientCategory, Integer>> entry : counts.entrySet()) {
 			String modId = entry.getKey();
 			int count = 0;
 			for (int value : entry.getValue().values()) {
@@ -100,15 +120,20 @@ final class ModCatalog {
 		return new ModCatalog(
 			Collections.unmodifiableMap(byMod),
 			List.copyOf(entries),
-			Collections.unmodifiableSet(new LinkedHashSet<>(byMod.keySet())));
+			Collections.unmodifiableSet(new LinkedHashSet<>(byMod.keySet())),
+			Collections.unmodifiableMap(counts),
+			Collections.unmodifiableMap(index),
+			Collections.unmodifiableMap(byKey));
 	}
 
 	/**
 	 * @return the number of ingredients read for this type, or -1 if JEI refused to hand them over
 	 */
 	private static int collectType(IIngredientManager ingredientManager, IIngredientType<?> type,
-								   Map<String, Map<IIngredientType<?>, List<Object>>> byMod,
-								   Map<String, Map<IIngredientType<?>, Integer>> countsByMod) {
+								   Map<String, Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>>> byMod,
+								   Map<String, Map<IngredientCategory, Integer>> counts,
+								   Map<FilterOptions.IngredientKey, FilterOptions.IngredientInfo> index,
+								   Map<FilterOptions.IngredientKey, Map.Entry<IIngredientType<?>, Object>> byKey) {
 		Collection<?> ingredients;
 		try {
 			ingredients = ingredientManager.getAllIngredients(type);
@@ -133,15 +158,39 @@ final class ModCatalog {
 			if (modId == null) {
 				continue;
 			}
+			IngredientCategory category = categoryOf(ingredient);
 			byMod.computeIfAbsent(modId, key -> new LinkedHashMap<>())
+				.computeIfAbsent(category, key -> new LinkedHashMap<>())
 				.computeIfAbsent(type, key -> new ArrayList<>())
 				.add(ingredient);
-			// Not a TreeMap: IIngredientType is not Comparable.
-			countsByMod.computeIfAbsent(modId, key -> new LinkedHashMap<>())
-				.merge(type, 1, Integer::sum);
+			counts.computeIfAbsent(modId, key -> new LinkedHashMap<>())
+				.merge(category, 1, Integer::sum);
+
+			FilterOptions.IngredientKey key = keyOf(helper, ingredient);
+			if (key != null) {
+				index.putIfAbsent(key, new FilterOptions.IngredientInfo(modId, category));
+				byKey.putIfAbsent(key, Map.entry(type, ingredient));
+			}
 			count++;
 		}
 		return count;
+	}
+
+	/**
+	 * How one ingredient is identified: its registry name plus JEI's unique id, so subtypes of the
+	 * same item (an enchanted book with different enchantments) stay distinct.
+	 */
+	private static FilterOptions.IngredientKey keyOf(IIngredientHelper<Object> helper, Object ingredient) {
+		try {
+			ResourceLocation location = helper.getResourceLocation(ingredient);
+			if (location == null) {
+				return null;
+			}
+			String uid = helper.getUniqueId(ingredient, UidContext.Ingredient);
+			return new FilterOptions.IngredientKey(location.getNamespace(), location.getPath() + "#" + uid);
+		} catch (RuntimeException e) {
+			return null;
+		}
 	}
 
 	@SuppressWarnings("unchecked")
@@ -175,6 +224,21 @@ final class ModCatalog {
 			// A single bad ingredient must not take the whole catalog down.
 			return null;
 		}
+	}
+
+	/**
+	 * Which category an ingredient belongs to. Anything that is not an item is "main", because the
+	 * categories are defined over items.
+	 *
+	 * <p>The registry name is passed along as well: the class is the primary answer, and the name is
+	 * the fallback for items that are one of these things without subclassing the base — for example
+	 * goety's {@code undeath_potion} item extends plain {@code Item}.
+	 */
+	private static IngredientCategory categoryOf(Object ingredient) {
+		if (!(ingredient instanceof ItemStack stack) || stack.isEmpty()) {
+			return IngredientCategory.MAIN;
+		}
+		return IngredientCategory.of(stack.getItem(), ForgeRegistries.ITEMS.getKey(stack.getItem()));
 	}
 
 	private static ModEntry.Kind classify(String modId) {
@@ -220,18 +284,120 @@ final class ModCatalog {
 		return this.loadedModIds;
 	}
 
-	/**
-	 * Every ingredient belonging to the named mods, keyed by ingredient type, ready to hand to JEI.
-	 */
+	/** Every category that mod has ingredients in, in the categories' own order. */
+	Set<IngredientCategory> categoriesOf(String modId) {
+		Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>> perCategory = this.byMod.get(modId);
+		if (perCategory == null || perCategory.isEmpty()) {
+			return Set.of();
+		}
+		Set<IngredientCategory> present = new LinkedHashSet<>();
+		for (IngredientCategory category : IngredientCategory.SELECTABLE) {
+			if (perCategory.containsKey(category)) {
+				present.add(category);
+			}
+		}
+		// Everything that is not a special category, including non-item ingredients.
+		if (perCategory.containsKey(IngredientCategory.MAIN)) {
+			present.add(IngredientCategory.MAIN);
+		}
+		return present;
+	}
+
+	int countOf(String modId, IngredientCategory category) {
+		return this.counts.getOrDefault(modId, Map.of()).getOrDefault(category, 0);
+	}
+
+	/** For each loaded mod, the categories it has ingredients in. */
+	Map<String, Set<IngredientCategory>> categoriesByMod() {
+		Map<String, Set<IngredientCategory>> result = new LinkedHashMap<>();
+		for (String modId : this.loadedModIds) {
+			result.put(modId, categoriesOf(modId));
+		}
+		return result;
+	}
+
+	/** How many loaded mods have ingredients in this category. */
+	int modCountOf(IngredientCategory category) {
+		int count = 0;
+		for (String modId : this.loadedModIds) {
+			if (this.byMod.getOrDefault(modId, Map.of()).containsKey(category)) {
+				count++;
+			}
+		}
+		return count;
+	}
+
+	/** The loaded mods that have ingredients in this category. */
+	List<String> modsWith(IngredientCategory category) {
+		List<String> mods = new ArrayList<>();
+		for (String modId : this.loadedModIds) {
+			if (this.byMod.getOrDefault(modId, Map.of()).containsKey(category)) {
+				mods.add(modId);
+			}
+		}
+		return mods;
+	}
+
+	int totalCountOf(IngredientCategory category) {
+		int total = 0;
+		for (String modId : this.loadedModIds) {
+			total += countOf(modId, category);
+		}
+		return total;
+	}
+
+	/** Every ingredient belonging to the named mods, keyed by ingredient type. */
 	Map<IIngredientType<?>, List<Object>> ingredientsOf(Collection<String> modIds) {
+		return ingredientsOf(modIds, null);
+	}
+
+	/**
+	 * Every ingredient belonging to the named mods, optionally restricted to one category.
+	 *
+	 * @param category the only category to include, or null for all of them
+	 */
+	Map<IIngredientType<?>, List<Object>> ingredientsOf(Collection<String> modIds,
+														IngredientCategory category) {
 		Map<IIngredientType<?>, List<Object>> result = new LinkedHashMap<>();
 		for (String modId : modIds) {
-			Map<IIngredientType<?>, List<Object>> perType = this.byMod.get(modId);
-			if (perType == null) {
+			Map<IngredientCategory, Map<IIngredientType<?>, List<Object>>> perCategory = this.byMod.get(modId);
+			if (perCategory == null) {
 				continue;
 			}
-			for (Map.Entry<IIngredientType<?>, List<Object>> entry : perType.entrySet()) {
-				result.computeIfAbsent(entry.getKey(), key -> new ArrayList<>()).addAll(entry.getValue());
+			for (Map.Entry<IngredientCategory, Map<IIngredientType<?>, List<Object>>> categoryEntry
+				: perCategory.entrySet()) {
+				if (category != null && categoryEntry.getKey() != category) {
+					continue;
+				}
+				for (Map.Entry<IIngredientType<?>, List<Object>> typeEntry : categoryEntry.getValue().entrySet()) {
+					result.computeIfAbsent(typeEntry.getKey(), key -> new ArrayList<>()).addAll(typeEntry.getValue());
+				}
+			}
+		}
+		return result;
+	}
+
+	// ------------------------------------------------------------------
+	// ingredient-level lookups, for hiding part of a mod
+	// ------------------------------------------------------------------
+
+	/** Where every known ingredient sits, keyed the way JEI identifies it. */
+	Map<FilterOptions.IngredientKey, FilterOptions.IngredientInfo> ingredientIndex() {
+		return this.ingredientIndex;
+	}
+
+	/**
+	 * The ingredients behind the given keys, grouped by ingredient type and ready for JEI.
+	 *
+	 * <p>Backed by a map built alongside the catalog rather than a scan, because this runs on every
+	 * checkbox click and the catalog can hold tens of thousands of ingredients.
+	 */
+	Map<IIngredientType<?>, List<Object>> ingredientsFor(Collection<FilterOptions.IngredientKey> keys) {
+		Map<IIngredientType<?>, List<Object>> result = new LinkedHashMap<>();
+		for (FilterOptions.IngredientKey key : keys) {
+			Map.Entry<IIngredientType<?>, Object> entry = this.byKey.get(key);
+			if (entry != null) {
+				result.computeIfAbsent(entry.getKey(), type -> new ArrayList<>()).add(entry.getValue());
 			}
 		}
 		return result;

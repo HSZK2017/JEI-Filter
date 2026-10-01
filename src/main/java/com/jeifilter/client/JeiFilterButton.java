@@ -136,11 +136,10 @@ public final class JeiFilterButton {
 
 	public void drawTooltip(GuiGraphics guiGraphics, int mouseX, int mouseY) {
 		JeiFilterService service = JeiFilterService.get();
-		int hiddenMods = service.hiddenModCount();
+		int hiddenIngredients = service.hiddenIngredientCount();
 		Component tooltip;
-		if (hiddenMods > 0) {
-			tooltip = Component.translatable("jei_filter.tooltip.button.active",
-				hiddenMods, service.hiddenIngredientCount());
+		if (hiddenIngredients > 0) {
+			tooltip = Component.translatable("jei_filter.tooltip.button.active", hiddenIngredients);
 		} else if (!service.isReady()) {
 			tooltip = Component.translatable("jei_filter.status.not_ready");
 		} else {

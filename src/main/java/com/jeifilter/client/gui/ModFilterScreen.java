@@ -1,15 +1,18 @@
 package com.jeifilter.client.gui;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 import org.lwjgl.glfw.GLFW;
 
-import com.jeifilter.filter.FilterMode;
 import com.jeifilter.filter.FilterOptions;
-import com.jeifilter.jei.JeiFilterService;
+import com.jeifilter.filter.IngredientCategory;
 import com.jeifilter.filter.ModEntry;
+import com.jeifilter.jei.JeiFilterService;
+import com.mojang.blaze3d.platform.InputConstants;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -25,15 +28,25 @@ import net.minecraftforge.api.distmarker.OnlyIn;
 /**
  * The menu opened by the hopper button next to JEI's search bar.
  *
- * <p>Every checkbox takes effect immediately, so the player can watch JEI react while the
- * screen is open, and the whole selection is written to disk as it changes.
+ * <p>Two levels. The top of the list holds one row per <em>category</em> — potions, arrows, enchanted
+ * books — and below it one row per mod. A mod row expands into one sub-row per category that mod
+ * actually has ingredients in, so a category can be turned off for one mod without losing the rest of
+ * that mod's items.
+ *
+ * <p>All three checkboxes work on one shared truth: a facet is either ticked or not, and an
+ * ingredient shows when its mod or its mod-plus-category is ticked. That is what makes a category's
+ * master checkbox able to drive every mod's sub-checkbox for that category, and what lets a sub-row
+ * override one mod afterwards.
+ *
+ * <p>Every change applies to JEI immediately, so the player can watch items disappear while the
+ * screen is open, and is written to disk as it changes.
  */
 @OnlyIn(Dist.CLIENT)
 public final class ModFilterScreen extends Screen {
-	private static final int MIN_WIDTH = 260;
-	private static final int MAX_WIDTH = 460;
+	private static final int MIN_WIDTH = 300;
+	private static final int MAX_WIDTH = 520;
 	private static final int MIN_HEIGHT = 160;
-	private static final int MAX_HEIGHT = 290;
+	private static final int MAX_HEIGHT = 300;
 	private static final int PADDING = 8;
 	private static final int ROW_HEIGHT = 14;
 	private static final int WIDGET_HEIGHT = 18;
@@ -45,32 +58,33 @@ public final class ModFilterScreen extends Screen {
 	private static final int COLOR_TEXT = 0xFFFFFFFF;
 	private static final int COLOR_TEXT_DIM = 0xFFA0A0A0;
 	private static final int COLOR_TEXT_FAINT = 0xFF707070;
+	private static final int COLOR_HEADER = 0xFFFFD479;
 	private static final int COLOR_DIVIDER = 0x60FFFFFF;
-	private static final int COLOR_CHECK = 0xFF55FF55;
+	private static final int COLOR_TICK = 0xFF55FF55;
+	private static final int COLOR_PARTIAL = 0xFFFFAA00;
 
 	private final Screen parent;
 	private final JeiFilterService service = JeiFilterService.get();
 
 	private EditBox searchBox;
-	private Button modeButton;
 	private Button sortButton;
 	private Button allButton;
 	private Button noneButton;
 	private Button invertButton;
 
 	private String query = "";
-	/** Entries matching {@link #query}, in display order. */
-	private List<ModEntry> filtered = List.of();
 	private ModEntry.Sort sort = ModEntry.Sort.NAME;
+	private List<Row> rows = List.of();
 	private int cursor = -1;
 	private int scrollRow;
+	/** Mods whose sub-rows are open. */
+	private final Set<String> expanded = new LinkedHashSet<>();
 
 	private int layoutLeft;
 	private int layoutTop;
 	private int layoutWidth;
 	private int layoutHeight;
-	private int headerHeight;
-	private int modeHintY;
+	private int hintY;
 	private int listTop;
 	private int listHeight;
 
@@ -78,6 +92,86 @@ public final class ModFilterScreen extends Screen {
 		super(Component.translatable("jei_filter.screen.title"));
 		this.parent = parent;
 	}
+
+	// ------------------------------------------------------------------
+	// rows
+	// ------------------------------------------------------------------
+
+	/** One line of the list: a category, a mod, or one category under one mod. */
+	private sealed interface Row {
+		/** A row that can be ticked, and reports its own three-state tick. */
+		sealed interface Tickable extends Row {
+			FilterOptions.TickState tick();
+		}
+
+		/** A category's master row, covering every mod that has it. */
+		record Category(IngredientCategory category, FilterOptions.TickState tick, int mods, int ingredients)
+			implements Tickable {
+		}
+
+		/** A mod row, plus the handle that opens its sub-rows. */
+		record Mod(ModEntry entry, FilterOptions.TickState tick, boolean open, List<IngredientCategory> subCategories)
+			implements Tickable {
+		}
+
+		/** One category under one mod. */
+		record Sub(String modId, IngredientCategory category, FilterOptions.TickState tick, int count)
+			implements Tickable {
+		}
+	}
+
+	private void rebuildRows() {
+		List<Row> result = new ArrayList<>();
+
+		for (IngredientCategory category : this.service.visibleCategories()) {
+			if (matches(categoryName(category).getString())) {
+				result.add(new Row.Category(category, this.service.categoryState(category),
+					this.service.categoryModCount(category), this.service.categoryIngredientCount(category)));
+			}
+		}
+
+		List<ModEntry> entries = new ArrayList<>();
+		for (ModEntry entry : this.service.modEntries()) {
+			if (this.query.isEmpty() || entry.matches(this.query)
+				|| this.service.categoriesOf(entry.modId()).stream()
+					.anyMatch(category -> matches(categoryName(category).getString()))) {
+				entries.add(entry);
+			}
+		}
+		entries.sort(this.sort.comparator());
+
+		// While searching, open every mod so the player can see what matched.
+		boolean querying = !this.query.isEmpty();
+		for (ModEntry entry : entries) {
+			List<IngredientCategory> categories = this.service.categoriesOf(entry.modId());
+			boolean open = querying || this.expanded.contains(entry.modId());
+			result.add(new Row.Mod(entry, this.service.modState(entry.modId()), open, categories));
+			if (open) {
+				for (IngredientCategory category : categories) {
+					result.add(new Row.Sub(entry.modId(), category,
+						this.service.isCategoryVisible(entry.modId(), category)
+							? FilterOptions.TickState.ALL : FilterOptions.TickState.NONE,
+						this.service.countOf(entry.modId(), category)));
+				}
+			}
+		}
+
+		this.rows = List.copyOf(result);
+		this.cursor = Mth.clamp(this.cursor, -1, this.rows.size() - 1);
+		clampScroll();
+	}
+
+	private boolean matches(String text) {
+		return this.query.isEmpty() || text.toLowerCase(Locale.ROOT).contains(this.query);
+	}
+
+	private static Component categoryName(IngredientCategory category) {
+		return Component.translatable(category.translationKey());
+	}
+
+	// ------------------------------------------------------------------
+	// layout
+	// ------------------------------------------------------------------
 
 	@Override
 	protected void init() {
@@ -90,31 +184,18 @@ public final class ModFilterScreen extends Screen {
 
 		int contentLeft = this.layoutLeft + PADDING;
 		int contentWidth = width - PADDING * 2;
-		// Header: the title line, then one line explaining what the current mode does.
-		this.headerHeight = 12 + 11;
-		int y = this.layoutTop + PADDING + this.headerHeight;
-		this.modeHintY = this.layoutTop + PADDING + 12;
-
-		// Row 1: mode toggle (what "checked" means) and sort order.
-		this.modeButton = Button.builder(modeLabel(), b -> {
-			FilterMode next = this.service.options().mode().next();
-			this.service.setMode(next);
-			refreshWidgets();
-		}).pos(contentLeft, y).size(contentWidth / 2 - 2, WIDGET_HEIGHT).build();
-		addRenderableWidget(this.modeButton);
+		int y = this.layoutTop + PADDING + 23;
+		this.hintY = this.layoutTop + PADDING + 12;
 
 		this.sortButton = Button.builder(sortLabel(), b -> {
 			this.sort = this.sort.next();
-			recomputeFiltered();
+			rebuildRows();
 			refreshWidgets();
-		}).pos(contentLeft + contentWidth / 2 + 2, y).size(contentWidth / 2 - 2, WIDGET_HEIGHT).build();
+		}).pos(contentLeft, y).size(contentWidth, WIDGET_HEIGHT).build();
 		addRenderableWidget(this.sortButton);
 
 		y += WIDGET_HEIGHT + 4;
 
-		// Row 2: search box plus the three selection shortcuts.
-		// The trailing -2 keeps the search box clear of the "All" button: three buttons plus three
-		// 2px gaps are subtracted, and the box would otherwise end exactly on the button.
 		int helperWidth = 44;
 		int searchWidth = contentWidth - (helperWidth + 2) * 3 - 2;
 		this.searchBox = new EditBox(this.font, contentLeft, y, searchWidth, WIDGET_HEIGHT,
@@ -122,7 +203,7 @@ public final class ModFilterScreen extends Screen {
 		this.searchBox.setHint(Component.translatable("jei_filter.search.hint").withStyle(ChatFormatting.DARK_GRAY));
 		this.searchBox.setResponder(text -> {
 			this.query = text.trim().toLowerCase(Locale.ROOT);
-			recomputeFiltered();
+			rebuildRows();
 			this.scrollRow = 0;
 			this.cursor = -1;
 		});
@@ -130,22 +211,22 @@ public final class ModFilterScreen extends Screen {
 		addRenderableWidget(this.searchBox);
 
 		int bx = contentLeft + searchWidth + 2;
-		this.allButton = Button.builder(Component.translatable("jei_filter.button.all"), b -> selectVisible(true))
+		this.allButton = Button.builder(Component.translatable("jei_filter.button.all"), b -> setAllTicked(true))
 			.pos(bx, y).size(helperWidth, WIDGET_HEIGHT).build();
 		addRenderableWidget(this.allButton);
 		bx += helperWidth + 2;
-		this.noneButton = Button.builder(Component.translatable("jei_filter.button.none"), b -> selectVisible(false))
+		this.noneButton = Button.builder(Component.translatable("jei_filter.button.none"), b -> setAllTicked(false))
 			.pos(bx, y).size(helperWidth, WIDGET_HEIGHT).build();
 		addRenderableWidget(this.noneButton);
 		bx += helperWidth + 2;
-		this.invertButton = Button.builder(Component.translatable("jei_filter.button.invert"), b -> invertVisible())
+		this.invertButton = Button.builder(Component.translatable("jei_filter.button.invert"), b -> invertShown())
 			.pos(bx, y).size(helperWidth, WIDGET_HEIGHT).build();
 		addRenderableWidget(this.invertButton);
 
 		y += WIDGET_HEIGHT + 4;
 		this.listTop = y;
-		// Leave room for the footer line plus the Done button at the bottom of the frame.
-		this.listHeight = Math.max(ROW_HEIGHT, this.layoutTop + height - PADDING - 12 - WIDGET_HEIGHT - 6 - y);
+		this.listHeight = Math.max(ROW_HEIGHT,
+			this.layoutTop + height - PADDING - 12 - WIDGET_HEIGHT - 6 - y);
 
 		int footerY = this.layoutTop + height - PADDING - WIDGET_HEIGHT;
 		addRenderableWidget(Button.builder(Component.translatable("gui.done"), b -> onClose())
@@ -153,13 +234,8 @@ public final class ModFilterScreen extends Screen {
 			.size(100, WIDGET_HEIGHT)
 			.build());
 
-		recomputeFiltered();
+		rebuildRows();
 		refreshWidgets();
-	}
-
-	private Component modeLabel() {
-		return Component.translatable("jei_filter.button.mode",
-			Component.translatable("jei_filter.mode." + this.service.options().mode().getId()));
 	}
 
 	private Component sortLabel() {
@@ -167,21 +243,8 @@ public final class ModFilterScreen extends Screen {
 			Component.translatable("jei_filter.sort." + this.sort.name().toLowerCase(Locale.ROOT)));
 	}
 
-	private void recomputeFiltered() {
-		List<ModEntry> result = new ArrayList<>();
-		for (ModEntry entry : this.service.modEntries()) {
-			if (entry.matches(this.query)) {
-				result.add(entry);
-			}
-		}
-		result.sort(this.sort.comparator());
-		this.filtered = List.copyOf(result);
-		this.cursor = Mth.clamp(this.cursor, -1, this.filtered.size() - 1);
-		clampScroll();
-	}
-
 	private void refreshWidgets() {
-		boolean empty = this.filtered.isEmpty();
+		boolean empty = this.rows.isEmpty();
 		if (this.allButton != null) {
 			this.allButton.active = !empty;
 		}
@@ -191,45 +254,83 @@ public final class ModFilterScreen extends Screen {
 		if (this.invertButton != null) {
 			this.invertButton.active = !empty;
 		}
-		if (this.modeButton != null) {
-			this.modeButton.setMessage(modeLabel());
-		}
 		if (this.sortButton != null) {
 			this.sortButton.setMessage(sortLabel());
 		}
 	}
 
 	// ------------------------------------------------------------------
-	// selection helpers
+	// selection actions
 	// ------------------------------------------------------------------
 
-	private List<String> visibleModIds() {
-		List<String> ids = new ArrayList<>(this.filtered.size());
-		for (ModEntry entry : this.filtered) {
-			ids.add(entry.modId());
+	/** The mods currently listed, which is what the bulk buttons act on. */
+	private List<String> listedModIds() {
+		Set<String> mods = new LinkedHashSet<>();
+		for (Row row : this.rows) {
+			if (row instanceof Row.Mod mod) {
+				mods.add(mod.entry().modId());
+			} else if (row instanceof Row.Sub sub) {
+				mods.add(sub.modId());
+			}
 		}
-		return ids;
+		return List.copyOf(mods);
 	}
 
-	private void selectVisible(boolean selected) {
-		List<String> ids = visibleModIds();
-		if (!ids.isEmpty()) {
-			this.service.setSelected(ids, selected);
+	private void setAllTicked(boolean ticked) {
+		List<String> mods = listedModIds();
+		if (!mods.isEmpty()) {
+			this.service.setModsTicked(mods, ticked);
+			rebuildRows();
 		}
 	}
 
-	private void invertVisible() {
-		List<String> ids = visibleModIds();
-		if (!ids.isEmpty()) {
-			this.service.invertSelection(ids);
+	private void invertShown() {
+		List<String> mods = listedModIds();
+		if (!mods.isEmpty()) {
+			this.service.invertSelection(mods);
+			rebuildRows();
 		}
+	}
+
+	/** A category's master checkbox: drives every mod that has that category. */
+	private void toggleCategory(IngredientCategory category) {
+		FilterOptions.TickState state = this.service.categoryState(category);
+		this.service.setCategoryTickedEverywhere(category, state != FilterOptions.TickState.ALL);
+		rebuildRows();
+	}
+
+	private void toggleMod(Row.Mod mod) {
+		this.service.setModTicked(mod.entry().modId(), mod.tick() != FilterOptions.TickState.ALL);
+		rebuildRows();
+	}
+
+	private void toggleSub(Row.Sub sub) {
+		this.service.setCategoryTicked(sub.modId(), sub.category(), sub.tick() != FilterOptions.TickState.ALL);
+		rebuildRows();
 	}
 
 	private void toggleRow(int index) {
-		if (index < 0 || index >= this.filtered.size()) {
+		if (index < 0 || index >= this.rows.size()) {
 			return;
 		}
-		this.service.toggleMod(this.filtered.get(index).modId());
+		Row row = this.rows.get(index);
+		if (row instanceof Row.Category category) {
+			toggleCategory(category.category());
+		} else if (row instanceof Row.Mod mod) {
+			// A plain click still hides the whole mod; the disclosure arrow is what opens sub-rows.
+			toggleMod(mod);
+		} else if (row instanceof Row.Sub sub) {
+			toggleSub(sub);
+		}
+		refreshWidgets();
+	}
+
+	private void toggleExpanded(Row.Mod mod) {
+		String modId = mod.entry().modId();
+		if (!this.expanded.remove(modId)) {
+			this.expanded.add(modId);
+		}
+		rebuildRows();
 	}
 
 	// ------------------------------------------------------------------
@@ -238,7 +339,7 @@ public final class ModFilterScreen extends Screen {
 
 	private int maxScrollRow() {
 		int visibleRows = Math.max(1, this.listHeight / ROW_HEIGHT);
-		return Math.max(0, this.filtered.size() - visibleRows);
+		return Math.max(0, this.rows.size() - visibleRows);
 	}
 
 	private void clampScroll() {
@@ -263,10 +364,7 @@ public final class ModFilterScreen extends Screen {
 			return -1;
 		}
 		int index = this.scrollRow + (int) ((mouseY - this.listTop) / ROW_HEIGHT);
-		if (index < 0 || index >= this.filtered.size()) {
-			return -1;
-		}
-		return index;
+		return index >= 0 && index < this.rows.size() ? index : -1;
 	}
 
 	private int rowTop(int index) {
@@ -300,35 +398,14 @@ public final class ModFilterScreen extends Screen {
 		int y = this.layoutTop + this.layoutHeight - PADDING - 10;
 		guiGraphics.fill(left, y - 3, right, y - 2, COLOR_DIVIDER);
 
-		FilterOptions options = this.service.options();
-		Component status;
-		if (!this.service.isReady()) {
-			status = Component.translatable("jei_filter.status.not_ready").withStyle(ChatFormatting.RED);
-		} else {
-			status = Component.translatable("jei_filter.status.summary",
-				this.filtered.size(), this.service.modEntries().size(), this.service.hiddenIngredientCount());
-		}
+		Component status = this.service.isReady()
+			? Component.translatable("jei_filter.status.summary",
+				this.service.hiddenIngredientCount(), this.service.tickedModCount())
+			: Component.translatable("jei_filter.status.not_ready").withStyle(ChatFormatting.RED);
 		guiGraphics.drawString(this.font, status, left, y, COLOR_TEXT_DIM, false);
 
-		int hiddenMods = this.service.hiddenModCount();
-		Component rightText;
-		if (hiddenMods > 0) {
-			rightText = Component.translatable("jei_filter.status.hidden_mods", hiddenMods)
-				.withStyle(ChatFormatting.GOLD);
-		} else {
-			rightText = Component.translatable("jei_filter.status.nothing_hidden")
-				.withStyle(ChatFormatting.DARK_GRAY);
-		}
-		int available = this.layoutLeft + this.layoutWidth - PADDING - 108;
-		if (available - left > this.font.width(rightText)) {
-			guiGraphics.drawString(this.font, rightText, available - this.font.width(rightText), y, COLOR_TEXT_DIM, false);
-		}
-
-		// A one line explanation of what the current mode does, under the title.
-		Component modeHint = Component.translatable(
-			"jei_filter.status.hint." + options.mode().getId());
-		guiGraphics.drawString(this.font, modeHint,
-			this.layoutLeft + PADDING, this.modeHintY, COLOR_TEXT_FAINT, false);
+		guiGraphics.drawString(this.font, Component.translatable("jei_filter.status.hint"),
+			this.layoutLeft + PADDING, this.hintY, COLOR_TEXT_FAINT, false);
 	}
 
 	private void renderList(GuiGraphics guiGraphics, int mouseX, int mouseY) {
@@ -338,7 +415,7 @@ public final class ModFilterScreen extends Screen {
 
 		guiGraphics.enableScissor(left, this.listTop, right + SCROLLBAR_WIDTH + 2, bottom);
 
-		if (this.filtered.isEmpty()) {
+		if (this.rows.isEmpty()) {
 			Component empty = this.service.isReady()
 				? Component.translatable("jei_filter.list.empty")
 				: Component.translatable("jei_filter.status.not_ready");
@@ -347,14 +424,11 @@ public final class ModFilterScreen extends Screen {
 
 		int hovered = rowAt(mouseY);
 		int first = this.scrollRow;
-		int visibleRows = this.listHeight / ROW_HEIGHT + 1;
-		int last = Math.min(this.filtered.size(), first + visibleRows);
+		int last = Math.min(this.rows.size(), first + this.listHeight / ROW_HEIGHT + 1);
 
 		for (int i = first; i < last; i++) {
-			ModEntry entry = this.filtered.get(i);
+			Row row = this.rows.get(i);
 			int y = rowTop(i);
-			boolean selected = this.service.options().isSelected(entry.modId());
-			boolean hidden = this.service.options().shouldHide(entry.modId());
 
 			if (i == hovered) {
 				guiGraphics.fill(left, y, right, y + ROW_HEIGHT, COLOR_ROW_HOVER);
@@ -362,28 +436,61 @@ public final class ModFilterScreen extends Screen {
 				guiGraphics.fill(left, y, right, y + ROW_HEIGHT, COLOR_ROW_CURSOR);
 			}
 
-			drawCheckbox(guiGraphics, left + 2, y + 2, selected);
+			if (row instanceof Row.Category category) {
+				drawTickBox(guiGraphics, left + 2, y + 2, category.tick());
+				guiGraphics.drawString(this.font, categoryName(category.category()),
+					left + 16, y + 3, COLOR_HEADER, false);
+				String detail = category.mods() + " mods, " + category.ingredients();
+				guiGraphics.drawString(this.font, detail, right - 4 - this.font.width(detail), y + 3,
+					COLOR_TEXT_FAINT, false);
+				// A divider under the last category separates the two levels.
+				if (i + 1 >= this.rows.size() || !(this.rows.get(i + 1) instanceof Row.Category)) {
+					guiGraphics.fill(left, y + ROW_HEIGHT - 1, right, y + ROW_HEIGHT, COLOR_DIVIDER);
+				}
+			} else if (row instanceof Row.Mod mod) {
+				String arrow = mod.open() ? "v" : ">";
+				guiGraphics.drawString(this.font, arrow, left + 1, y + 3, COLOR_TEXT_DIM, false);
+				drawTickBox(guiGraphics, left + 10, y + 2, mod.tick());
 
-			int countWidth = this.font.width(Integer.toString(entry.itemCount()));
-			int nameMax = right - 22 - countWidth - (left + 16);
-			String name = this.font.plainSubstrByWidth(entry.modName(), Math.max(0, nameMax));
-			int textColor = hidden ? COLOR_TEXT_DIM : COLOR_TEXT;
-			guiGraphics.drawString(this.font, name, left + 16, y + 3, textColor, false);
+				int countWidth = this.font.width(Integer.toString(mod.entry().itemCount()));
+				int nameMax = right - 22 - countWidth - (left + 24);
+				String name = this.font.plainSubstrByWidth(mod.entry().modName(), Math.max(0, nameMax));
+				guiGraphics.drawString(this.font, name, left + 24, y + 3, COLOR_TEXT, false);
 
-			// Draw the mod id after the name when there is room for a useful amount of it.
-			int nameWidth = this.font.width(name);
-			int idSpace = nameMax - nameWidth - 6;
-			if (idSpace > 16) {
-				String id = this.font.plainSubstrByWidth(entry.modId(), idSpace);
-				guiGraphics.drawString(this.font, id, left + 16 + nameWidth + 6, y + 3, COLOR_TEXT_FAINT, false);
+				String count = Integer.toString(mod.entry().itemCount());
+				guiGraphics.drawString(this.font, count, right - 4 - countWidth, y + 3, COLOR_TEXT_DIM, false);
+			} else if (row instanceof Row.Sub sub) {
+				drawTickBox(guiGraphics, left + 24, y + 2, sub.tick());
+				guiGraphics.drawString(this.font, categoryName(sub.category()),
+					left + 38, y + 3, COLOR_TEXT_DIM, false);
+				String count = Integer.toString(sub.count());
+				guiGraphics.drawString(this.font, count, right - 4 - this.font.width(count), y + 3,
+					COLOR_TEXT_FAINT, false);
 			}
-
-			String count = Integer.toString(entry.itemCount());
-			guiGraphics.drawString(this.font, count, right - 4 - countWidth, y + 3, COLOR_TEXT_DIM, false);
 		}
 		guiGraphics.disableScissor();
 
 		renderScrollbar(guiGraphics, right + 2);
+	}
+
+	/**
+	 * Draws a checkbox in one of its three states: empty for "none of this is shown", a filled square
+	 * for "some of it is shown", and a tick for "all of it is shown".
+	 */
+	private static void drawTickBox(GuiGraphics guiGraphics, int x, int y, FilterOptions.TickState state) {
+		guiGraphics.fill(x, y, x + 9, y + 9, 0xFF101010);
+		guiGraphics.renderOutline(x, y, 9, 9, COLOR_BORDER);
+		switch (state) {
+			case ALL -> {
+				// A tick, as two strokes.
+				guiGraphics.fill(x + 2, y + 4, x + 4, y + 7, COLOR_TICK);
+				guiGraphics.fill(x + 4, y + 2, x + 7, y + 5, COLOR_TICK);
+			}
+			case SOME -> guiGraphics.fill(x + 2, y + 2, x + 7, y + 7, COLOR_PARTIAL);
+			case NONE -> {
+				// Left empty.
+			}
+		}
 	}
 
 	private void renderScrollbar(GuiGraphics guiGraphics, int x) {
@@ -396,18 +503,10 @@ public final class ModFilterScreen extends Screen {
 		guiGraphics.fill(x, trackTop, x + SCROLLBAR_WIDTH, trackTop + trackHeight, 0x40000000);
 
 		int visibleRows = Math.max(1, trackHeight / ROW_HEIGHT);
-		int totalRows = Math.max(1, this.filtered.size());
+		int totalRows = Math.max(1, this.rows.size());
 		int thumbHeight = Math.max(10, Math.min(trackHeight, trackHeight * visibleRows / totalRows));
 		int thumbTop = trackTop + (int) ((trackHeight - thumbHeight) * ((double) this.scrollRow / maxRow));
 		guiGraphics.fill(x, thumbTop, x + SCROLLBAR_WIDTH, thumbTop + thumbHeight, COLOR_BORDER);
-	}
-
-	private static void drawCheckbox(GuiGraphics guiGraphics, int x, int y, boolean checked) {
-		guiGraphics.fill(x, y, x + 9, y + 9, 0xFF101010);
-		guiGraphics.renderOutline(x, y, 9, 9, COLOR_BORDER);
-		if (checked) {
-			guiGraphics.fill(x + 2, y + 2, x + 7, y + 7, COLOR_CHECK);
-		}
 	}
 
 	// ------------------------------------------------------------------
@@ -419,7 +518,7 @@ public final class ModFilterScreen extends Screen {
 		if (super.mouseClicked(mouseX, mouseY, button)) {
 			return true;
 		}
-		if (button != GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+		if (button != InputConstants.MOUSE_BUTTON_LEFT) {
 			return false;
 		}
 		int left = this.layoutLeft + PADDING;
@@ -427,11 +526,19 @@ public final class ModFilterScreen extends Screen {
 		if (mouseX < left || mouseX >= right) {
 			return false;
 		}
+
 		int index = rowAt(mouseY);
 		if (index < 0) {
 			return false;
 		}
 		this.cursor = index;
+
+		// Clicking a mod row's disclosure arrow opens its sub-rows instead of hiding the mod.
+		Row row = this.rows.get(index);
+		if (row instanceof Row.Mod mod && mouseX < left + 10) {
+			toggleExpanded(mod);
+			return true;
+		}
 		toggleRow(index);
 		return true;
 	}
@@ -450,8 +557,8 @@ public final class ModFilterScreen extends Screen {
 
 	@Override
 	public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-		if (this.searchBox != null && this.searchBox.isFocused() &&
-			keyCode != GLFW.GLFW_KEY_ESCAPE && keyCode != GLFW.GLFW_KEY_DOWN && keyCode != GLFW.GLFW_KEY_UP) {
+		if (this.searchBox != null && this.searchBox.isFocused()
+			&& keyCode != GLFW.GLFW_KEY_ESCAPE && keyCode != GLFW.GLFW_KEY_DOWN && keyCode != GLFW.GLFW_KEY_UP) {
 			return super.keyPressed(keyCode, scanCode, modifiers);
 		}
 		switch (keyCode) {
@@ -478,40 +585,52 @@ public final class ModFilterScreen extends Screen {
 				}
 				return false;
 			}
+			case GLFW.GLFW_KEY_RIGHT -> {
+				setCursorExpanded(true);
+				return true;
+			}
+			case GLFW.GLFW_KEY_LEFT -> {
+				setCursorExpanded(false);
+				return true;
+			}
 			default -> {
 				return super.keyPressed(keyCode, scanCode, modifiers);
 			}
 		}
 	}
 
+	private void setCursorExpanded(boolean open) {
+		if (this.cursor < 0 || this.cursor >= this.rows.size()) {
+			return;
+		}
+		if (this.rows.get(this.cursor) instanceof Row.Mod mod) {
+			String modId = mod.entry().modId();
+			if (open) {
+				this.expanded.add(modId);
+			} else {
+				this.expanded.remove(modId);
+			}
+			rebuildRows();
+		}
+	}
+
 	private void moveCursor(int delta) {
-		if (this.filtered.isEmpty()) {
+		if (this.rows.isEmpty()) {
 			return;
 		}
 		int next = this.cursor < 0 ? 0 : this.cursor + delta;
-		this.cursor = Mth.clamp(next, 0, this.filtered.size() - 1);
+		this.cursor = Mth.clamp(next, 0, this.rows.size() - 1);
 		ensureVisible(this.cursor);
 	}
 
 	@Override
 	public void onClose() {
-		// What the player checked is kept; the mod filter persists to disk as it changes.
-		Minecraft minecraft = Minecraft.getInstance();
-		minecraft.setScreen(this.parent);
+		// What the player ticked is kept; the filter persists to disk as it changes.
+		Minecraft.getInstance().setScreen(this.parent);
 	}
 
 	@Override
 	public boolean isPauseScreen() {
 		return false;
-	}
-
-	/** For tests: the mods currently listed after the search box filter is applied. */
-	public List<ModEntry> visibleEntries() {
-		return this.filtered;
-	}
-
-	/** For tests: the row the keyboard cursor is on, or -1. */
-	public int cursorRow() {
-		return this.cursor;
 	}
 }

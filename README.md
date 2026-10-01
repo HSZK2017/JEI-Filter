@@ -1,9 +1,10 @@
 # JEI Filter
 
 A client-side addon for [Just Enough Items](https://github.com/mezz/JustEnoughItems) on **Minecraft 1.20.1 / Forge**.
-It adds a **hopper button to the left edge of JEI's search bar**. Clicking it opens a menu where you tick
-mods to hide everything they register from JEI, with both **positive selection (show only checked)** and
-**negative selection (hide checked)**.
+It adds a **hopper button to the left edge of JEI's search bar**. Clicking it opens a menu where you
+tick what JEI should show, on two independent axes: **by mod**, and by **what kind of thing it is**
+(potions, arrows, enchanted books). Everything starts ticked, so a fresh install changes nothing, and
+you hide things by unticking them.
 
 ## What it looks like
 
@@ -20,34 +21,96 @@ mods to hide everything they register from JEI, with both **positive selection (
 ```
 
 While a filter is active a **green dot** is drawn in the button's bottom-right corner, so you can tell
-at a glance that JEI is hiding something. Hovering it shows the tooltip with the number of hidden mods
-and ingredients.
+at a glance that JEI is hiding something. Hovering it shows the tooltip with the number of hidden
+ingredients.
 
 ## The filter menu
 
+The list has two levels. At the top, one row per **category**; below it, one row per **mod**, each of
+which expands into one sub-row per category that mod actually has.
+
+```
+[x] Potions            12 mods, 340
+[x] Arrows              4 mods,  61
+[x] Enchanted Books     8 mods, 190
+──────────────────────────────────
+> [x] Create                482
+v [~] Mekanism              912
+      [x] Potions           96
+      [ ] Arrows            12
+      [x] Other items      804
+> [x] Minecraft            1558
+```
+
+**A ticked box means "show it".** Nothing is hidden until you untick something, and every box reads
+that way wherever it appears — there is no mode in which a tick means "hide", because a box that flips
+its meaning is how the two levels get out of step.
+
 | Control | What it does |
 |---|---|
-| **Mode: Hide checked** (blacklist) | Checked mods are hidden from JEI. Default; nothing is hidden until you tick something. |
-| **Mode: Show only checked** (whitelist) | Everything is hidden *except* the checked mods. |
-| **Sort: Name / Items / Mod ID** | Reorders the list. "Items" puts the mods with the most items first, which is the fastest way to find a big mod. |
-| **Search box** | Filters the list by mod name or mod id. |
-| **All / None / Invert** | Bulk-select the mods currently listed by the search box. Invert is the reverse selection: everything listed flips. |
-| **Checkbox, or click the row** | Toggles one mod. Changes apply to JEI immediately, so you can watch items disappear while the screen is open. |
-| **Keyboard** | Up/Down move the cursor, Space/Enter toggle, Page Up/Down scroll, Escape closes. |
+| **Category row** | A master switch over that category for **every** mod. Ticking or unticking it ticks or unticks each mod's sub-row for that category at once. |
+| **Mod row (`>` / `v`)** | The arrow opens the mod's category sub-rows. Clicking the row itself ticks the whole mod, which shows everything it has. |
+| **Mod sub-row** | One category of one mod. Untick it to hide just that — everyone else's potions stay, and so does the rest of this mod. |
+| **Search box** | Filters by mod name, mod id, or category name. Matches open automatically so you can see why they matched. |
+| **Sort: Name / Items / Mod ID** | Reorders the mod list. "Items" puts the biggest mods first, which is the fastest way to find one. |
+| **All / None / Invert** | Bulk-select everything currently listed. Invert flips it. |
+| **Keyboard** | Up/Down move, Space/Enter toggle, Left/Right collapse/expand a mod, Page Up/Down scroll, Escape closes. |
+
+### The three-state boxes
+
+A checkbox reads as one of three things, and both levels work the same way:
+
+| Box | Meaning |
+|---|---|
+| ☐ empty | nothing under this row is shown |
+| ▣ square | **some** of what is under this row is shown — e.g. some mods' potions are on and others are not |
+| ☑ tick | **all** of what is under this row is shown |
+
+The category row is a pure aggregate of the sub-rows beneath it — it is not a separate setting. That
+one rule is what makes it able to drive them: tick it and every mod's sub-row for that category ticks;
+untick it and they all clear; tick one mod's sub-row afterwards and the category row drops to the
+square "mixed" state.
+
+### How the two levels combine
+
+An item is shown when **either** its mod's box is ticked **or** the box for its category under that mod
+is:
+
+```
+shown(mod, category) = (ticked(mod) and not unticked(mod|category)) or ticked(mod|category)
+```
+
+So ticking a mod shows everything it has, and unticking one category of a ticked mod hides just that
+category while the rest stays. The `unticked(mod|category)` term is what makes that last case work: the
+mod's tick has to keep showing its *other* categories, so turning one off is recorded as an exception
+rather than by clearing the mod's tick. `unticked` is the second of the two lists in the saved config.
+
+### A fresh install shows everything
+
+Every mod is ticked the first time JEI reports it, so JEI behaves normally until you untick something.
+A mod that loads later is ticked too, rather than appearing already hidden.
 
 Every change is written to `config/jei_filter.json` immediately, so the filter survives a restart.
 
 ```json
 {
-  "_comment": "Mods checked in JEI's filter button menu, and what checked means.",
   "options": {
-    "mode": "blacklist",
-    "selected": ["mekanism", "thermal"]
+    "ticked": ["mekanism", "thermal|potion", "create|enchanted_book"],
+    "unticked": ["mekanism|arrow"]
   }
 }
 ```
 
-Delete that file (or untick everything) to get back to a stock JEI.
+A facet is either a whole mod (`"mekanism"`) or one category of one mod (`"thermal|potion"`). The
+category ids are `potion`, `arrow`, `enchanted_book` and `main`; `main` is the fallback bucket holding
+everything else, including fluids.
+
+`unticked` holds individual categories turned off while their mod stays ticked, and is omitted when
+empty. In the example above mekanism is shown as a whole except its arrows, thermal shows only its
+potions, and create shows only its enchanted books.
+
+A config written by an older version of this mod still loads: `ticked`, `tickedMods` and `selected`
+are all read, and all of them held whole-mod keys, which are still whole-mod facets.
 
 ## How it works
 
@@ -55,8 +118,7 @@ Delete that file (or untick everything) to get back to a stock JEI.
   types (items, Forge fluids, and anything another mod registers). `ModCatalog` walks
   `IIngredientManager#getRegisteredIngredientTypes()`, reads `getAllIngredients` for each, and
   attributes every ingredient to a mod. That is what makes "hide this mod" cover its fluids and
-  custom ingredients too, and it is why a whitelist that keeps only `minecraft` leaves no fluid
-  behind.
+  custom ingredients too, and it is why keeping only `minecraft` ticked leaves no fluid behind.
 - **Attribution follows JEI, not the registry name.** `ModAttribution` asks for the ingredient's
   *creator* mod id first (JEI's `IIngredientHelper#getDisplayModId`, which for an `ItemStack` is
   Forge's `Item#getCreatorModId`) and only falls back to the namespace of the registry name. This
@@ -66,6 +128,32 @@ Delete that file (or untick everything) to get back to a stock JEI.
   the precedence.
 - **The mod list** is the aggregation of that catalog: one row per mod, with the count of everything
   that mod contributes across all ingredient types, and the display name from JEI's `IModIdHelper`.
+- **Categories are decided by class, then by registry name.** `IngredientCategory` checks the item's
+  type first: `PotionItem`, `ArrowItem`, `EnchantedBookItem`. That is the authoritative answer and it
+  covers vanilla too, because every potion in the game *is* a `PotionItem`. It also covers modded
+  items properly — checked with `javap` against this pack:
+
+  | Mod | Class | Extends |
+  |---|---|---|
+  | soulslike-weaponry | `CustomPotionItem` | `PotionItem` |
+  | soulslike-weaponry | `CustomSplashPotion` | `CustomPotionItem` |
+  | iceandfire | `ItemDragonArrow` | `ArrowItem` |
+  | alexsmobs | `ItemModArrow` | `ArrowItem` |
+  | alexscaves | `BurrowingArrowItem` | `ArrowItem` |
+  | goety | `BrewArrowItem` | `ArrowItem` |
+  | goety | `UndeathPotionItem` | `Item` ← only its name identifies it |
+
+  The registry name is the **fallback**, which is what catches that last one and any other item that
+  is one of these things without subclassing the base. The name has to be a whole trailing segment,
+  so `splash_potion` matches but `potion_magazine` does not — a rule that matched on `contains` would
+  sweep unrelated items into a category, and hiding a category hides everything in it.
+  `ModClassifier` owns the ordering (and is Minecraft-free so it can be tested), `ModClassifierTest`
+  pins it, and `IngredientCategory` supplies the real class predicates.
+- **Hiding is per ingredient, not per mod.** The plan is a set of ingredients, because that is the only
+  unit that can express "every potion in the pack, but nothing else". `ModCatalog` indexes every
+  ingredient by its registry name plus JEI's unique id (so two enchanted books with different
+  enchantments stay distinct) and keeps the reverse map, so applying a change does not rescan tens of
+  thousands of ingredients on every checkbox click.
 - **Hiding goes through `JeiVisibilityBridge`**, which picks the API the running JEI actually has.
   JEI only grew `IIngredientVisibility#hideIngredients`/`#unhideIngredients` (with
   `UidContext.Ingredient` + `UidContext.Recipe`) in **15.55.0**; before that the public route is
@@ -86,10 +174,14 @@ Delete that file (or untick everything) to get back to a stock JEI.
 - **The "filter is active" badge is a drawn dot**, not a tint. JEI renders the icon through the item
   render path, which does not honour `RenderSystem.setShaderColor`, so a tinted hopper measures
   identical to an untinted one. The dot is painted in the button's bottom-right corner, and the
-  tooltip switches to `Filtering N mods (M items hidden)`.
+  tooltip switches to `N ingredients hidden`.
+- **A mod first seen later is ticked automatically.** `rebuildCatalog` notices mods that no earlier
+  catalog had and ticks their facets before applying. Without that, a mod that loads after the saved
+  config was written would be hidden the instant it appeared, because an unticked
+  facet is a hidden one.
 - **A partial ingredient list is never applied.** Ingredient lookups do not have a "finished
   loading" signal, so `rebuildCatalog` refuses a catalog that is missing mods the previous one had.
-  This matters in whitelist mode, where "not in the catalog" would otherwise mean "hidden" and mods
+  This matters because "not in the catalog" would otherwise mean "hidden" and mods
   could flicker out and back in while JEI is still loading.
 - **On JEI older than 15.55.0 the catalog is never re-read while a filter is active.** That route
   hides by taking ingredients *out* of JEI's list, so re-reading it would return the filtered list,
@@ -139,7 +231,7 @@ Useful tasks:
 
 ```
 gradlew.bat build          # compile + mixin annotation processing + jar + tests
-gradlew.bat unitTest       # JUnit tests only (37 tests)
+gradlew.bat unitTest       # JUnit tests only (60 tests)
 gradlew.bat runClient      # dev client with JEI loaded
 gradlew.bat runServer      # dev server; JEI Filter is client-only and does nothing here
 ```
@@ -172,8 +264,16 @@ JEI Filter is loading (client side = true)
 ...
 jei_filter: hopper filter button created for the JEI search bar
 jei_filter: JEI exposes <ingredients> ingredients from <mods> mods across <types> ingredient type(s)
-jei_filter: hiding <mods> mods (<ingredients> ingredients) from JEI
+jei_filter: hiding <ingredients> ingredients from JEI
+jei_filter: category potion: <n> ingredients across <m> mods
+jei_filter: category arrow: <n> ingredients across <m> mods
+jei_filter: category enchanted_book: <n> ingredients across <m> mods
+jei_filter: <n> ingredients are in no special category
 ```
+
+The `category` lines are the category rules reporting what they found. A category that finds nothing is
+omitted, and one whose count looks wrong means `IngredientCategory#matchesPath` is over- or
+under-matching — which is worth checking, because hiding a category hides everything in it.
 
 and `logs/debug.log` contains one `Mixing ...` line per mixin:
 
@@ -205,33 +305,62 @@ On **JEI 15.62.0.217**:
 
 - Both mixins apply to the real classes; the hopper renders at the left of JEI's search bar with a
   working tooltip; clicking it opens the menu.
-- In the default "hide checked" mode, ticking `Minecraft` hides all 1559 of its item ingredients and
-  the overlay's grid empties; unticking brings them back. JEI's own log confirms the direction
-  (`hidden` on the tick, `unhidden` on the untick).
+- Unticking `Minecraft` hides all 1559 of its item ingredients and the overlay's grid empties;
+  re-ticking brings them back. JEI's own log confirms the direction (`hidden` on the untick,
+  `unhidden` on the re-tick).
 - The "filter is active" dot is visible (measured `max(G−R)` of 6 inactive vs 170 active in the
-  button's corner) and the tooltip switches to `Filtering N mods (M items hidden)`.
+  button's corner) and the tooltip switches to `N ingredients hidden`.
 - The selection persists to `config/jei_filter.json` and is read back on the next start.
 
-On **JEI 15.20.0.129** (an older pack — the `removeIngredientsAtRuntime` route):
+**Note:** the checkbox model was rewritten after those runs (the mode was removed and the
+category-exception set added), so the bullet above about how the boxes read describes the current
+build only in shape — the numbers and the persistence were measured on it, the exact click-through was
+not.
+
+On **JEI 15.20.0.129** (an older pack — the `removeIngredientsAtRuntime` route), current build:
 
 - Both mixins still apply, the mod loads, the button is created, and the catalog is read once.
-- Hiding covers **every ingredient type**: a filter produces
-  `Ingredients are being removed at runtime: 1556 ... ItemStack` **and**
-  `... 2 ... FluidStack`.
+- **A fresh install hides nothing.** With no config file the mod writes `{"ticked":["<modid>"]}` and
+  logs `hiding 0 ingredients`, so JEI behaves as if the mod were not installed until something is
+  unticked.
+- **Categories classify real ingredients.** Measured in the dev client:
+  ```
+  category potion: 126 ingredients across 1 mods
+  category arrow: 44 ingredients across 1 mods
+  category enchanted_book: 113 ingredients across 1 mods
+  1275 ingredients are in no special category
+  ```
+  126 + 44 + 113 + 1275 = 1558, the same total the catalog reports, so every ingredient is accounted
+  for exactly once.
+- **Unticking a category hides exactly that category, and nothing else.** Driving every box in turn
+  produced hides of exactly `126` (potions), `44` (arrows), `113` (enchanted books), `1275` (the
+  ordinary items) and `1558` (the whole mod), each returning to `0` when re-ticked. Nothing was over-
+  or under-hidden, which is what says the two levels are composing correctly.
+- **The selection persists at facet granularity.** After driving those toggles the saved config was
+  `{"ticked":["minecraft|main"]}` — a single mod-plus-category facet, which the next start read back.
+- Hiding covers **every ingredient type**: `... removed at runtime: N ... ItemStack` **and**
+  `... N ... FluidStack`.
 - Items stay hidden. Verified by asking JEI what it is currently showing after a hide:
-  `catalogHas=1556` against `jeiShows=0`, then `jeiShows=1556` again after unticking.
+  `catalogHas=1556` against `jeiShows=0`, then `jeiShows=1556` again after re-ticking.
 - No recursion, no crash, and nothing is added back seconds later.
 
-Reported working by the user in a **324-mod pack** on JEI 15.20.0.129, whitelist mode with only
-`minecraft` ticked: modded potions, potion arrows, enchanted books and fluids are all gone.
+Reported working by the user in a **324-mod pack** on JEI 15.20.0.129: modded potions, potion arrows,
+enchanted books and fluids can all be hidden.
 
 ### Not covered by the checks above
 
-- The **JEI 15.55.0+ hiding path has not been exercised since the attribution fix**. It is the same
-  decision code feeding a different call, and it worked before that change, but the exact build
-  shipped here was only run end to end on JEI 15.20. If you are on 15.55+, the equivalent check is
-  that ticking a mod logs `Ingredients are being hidden at runtime in [Ingredient, Recipe]` for each
-  ingredient type, and that unticking logs the `unhidden` counterpart.
+- **The two-level menu has not been driven through the GUI in a large pack.** The category model, the
+  three-state boxes and the master/sub-box syncing are covered by 60 unit tests, and the end-to-end
+  category hiding above was verified in a real client — but that client has one mod, so "some mods'
+  potions on and others off" was only exercised in tests, never on screen.
+- **The checkbox model was rewritten late**, after the first round of user testing, so the menu
+  click-through itself has not been re-confirmed on screen since. What was measured on this build is
+  the filtering behaviour and the persistence, not the clicking.
+- **The JEI 15.55.0+ hiding path has not been re-run since the category change.** It is the same
+  decision code feeding a different call, but the build shipped here was only run end to end on JEI
+  15.20. If you are on 15.55+, the equivalent check is that ticking a category logs
+  `Ingredients are being hidden at runtime in [Ingredient, Recipe]` and that unticking logs the
+  `unhidden` counterpart.
 - Recipe-slot and catalyst hiding (`UidContext.Recipe`) only exists on 15.55.0+; on older JEI the
   ingredient list is what is filtered.
 
@@ -240,7 +369,7 @@ Reported working by the user in a **324-mod pack** on JEI 15.20.0.129, whitelist
 - A mod is only filterable if JEI can attribute its ingredients to it. An ingredient that reports
   neither a creator mod id nor a registry namespace is skipped entirely; one that reports only
   `minecraft` (a vanilla item) stays with `minecraft`.
-- Whitelist mode with nothing ticked hides everything, including vanilla. There is no "you are about
+- With every mod unticked, nothing is shown at all. There is no "you are about
   to hide everything" confirmation.
 - On JEI older than 15.55.0, applying a filter makes JEI log a remove/add pair per ingredient type
   per application, because `removeIngredientsAtRuntime`/`addIngredientsAtRuntime` is the only public
@@ -253,15 +382,16 @@ src/main/java/com/jeifilter/
   JeiFilterMod.java              mod entry point; registers the screen-level click hook
   jei/JeiFilterPlugin.java       IModPlugin: JEI runtime available / unavailable
   jei/JeiFilterService.java      filter state, catalog, hide/unhide driver, persistence
-  jei/ModCatalog.java            every ingredient of every type, grouped by mod
+  jei/ModCatalog.java            every ingredient, grouped by mod and category, with both indexes
   jei/JeiVisibilityBridge.java   picks hideIngredients (15.55+) or removeIngredientsAtRuntime
+  filter/IngredientCategory.java potion / arrow / enchanted_book, by item class then by name
+  filter/ModClassifier.java      which category wins, as a pure function (no Minecraft types)
   filter/ModAttribution.java     creator-mod-id first, registry namespace as the fallback
-  filter/FilterOptions.java      immutable selection + mode, JSON round trip, hide/unhide plan
-  filter/FilterMode.java         blacklist / whitelist
+  filter/FilterOptions.java      the two-level selection, three-state reads, hide/unhide plan, JSON
   filter/ModEntry.java           one row of the menu, and its sort orders
   client/JeiFilterButton.java    the hopper button and its "filter is active" dot
   client/JeiFilterInputEvents.java  screen-level click hook for the hopper
-  client/gui/ModFilterScreen.java   the menu
+  client/gui/ModFilterScreen.java   the menu: category rows over expandable mod rows
   mixin/IngredientListOverlayMixin.java   search bar layout, draw, tooltip
   mixin/GuiTextFieldFilterAccessor.java   reads JEI's search field bounds
 src/main/resources/
@@ -270,8 +400,8 @@ src/main/resources/
   assets/jei_filter/lang/        en_us + zh_cn
   jei_filter.png                 mod logo
 src/unitTest/java/com/jeifilter/filter/
-  FilterOptionsTest.java         selection, mode, JSON round trip
-  FilterPlanTest.java            which mods get hidden vs unhidden
+  FilterOptionsTest.java         both axes, three-state reads, master/sub syncing, plan, JSON
+  ModClassifierTest.java         class-before-name ordering, and what must *not* match by name
   ModAttributionTest.java        creator mod id vs registry namespace
   ModEntryTest.java              search matching and sort orders
 ```
@@ -279,18 +409,23 @@ src/unitTest/java/com/jeifilter/filter/
 ## Limitations
 
 - **Client only.** Nothing happens on a dedicated server; the mod is not needed there.
-- Hiding is by **mod**, not by individual ingredient. To hide a single item, use JEI's own
-  hide-item feature.
+- **The unit of filtering is a mod, or a category within a mod.** There is no way to hide one specific
+  item; use JEI's own hide-item feature for that.
+- The categories are **potions, arrows and enchanted books**. Adding another means editing
+  `IngredientCategory` (the enum plus its `matchesPath` case) and adding a lang key — the rest of the
+  mod picks it up from `SELECTABLE`.
 - A mod only appears in the menu once JEI is reporting ingredients for it, which happens when a world
   is loaded. The menu is empty on the title screen.
 - Hiding `jei` itself is allowed; it hides JEI's own items. JEI's lookup history is unaffected.
-- Changing the selection makes JEI remove or re-add ingredients, so on older JEI a large filter
-  change is visible for a moment as the list re-populates.
+- Changing the selection makes JEI remove or re-add ingredients, so on older JEI a large filter change
+  is visible for a moment as the list re-populates.
+- The saved config holds one entry per ticked facet, so it grows with the number of mods. That is a few
+  hundred entries in a large pack.
 
 ## Development notes
 
-Five defects in this mod were only findable in a large pack, not in the single-mod dev instance.
-They are recorded here because each one is a trap worth recognising again:
+Six defects in this mod were only findable in a large pack, not in the single-mod dev instance. They
+are recorded here because each one is a trap worth recognising again:
 
 | Symptom | Cause |
 |---|---|
@@ -299,8 +434,9 @@ They are recorded here because each one is a trap worth recognising again:
 | `StackOverflowError` on an older JEI | `removeIngredientsAtRuntime`/`addIngredientsAtRuntime` notify ingredient listeners synchronously, and this mod is one. |
 | Hidden items reappear seconds later on an older JEI | The catalog was re-read while the filter was applied, so it returned the *filtered* list and the hidden mods looked absent. |
 | Items reappear, then disappear again | A menu open rebuilt the catalog in the middle of a hide, so the hidden set was recomputed from a half-applied state. |
+| Hiding one category hid the whole mod | The plan worked in whole mods. A category is not expressible as a set of mods, so the unit had to become the ingredient. |
 
-Two lessons that generalise:
+Four lessons that generalise:
 
 - **A hide that "ran" is not a hide that "took".** On the older JEI route the ingredient list is the
   thing being modified, so reading it back after hiding returns the filtered list. The useful
@@ -308,6 +444,20 @@ Two lessons that generalise:
   whether a hide call was issued.
 - **Attribution errors are invisible in small dev instances** and obvious in a large pack, because
   they only show up for ingredients whose registry name disagrees with the mod that added them.
+- **A two-level selection needs one rule, not two settings.** "Visible when the mod facet or the
+  category facet is ticked" is what makes the category checkbox a master switch over the sub-checkboxes
+  and keeps a single source of truth. Any extra flag to remember "the category was turned off" would
+  re-introduce the disagreement between what the boxes show and what the filter does.
+- **A classification rule that matches too much is worse than one that matches too little.** Hiding a
+  category hides everything in it, so `potion_magazine` being filed as a potion costs the player items
+  they never chose to hide. `ModClassifierTest` asserts the near-misses explicitly. The same reasoning
+  is why classification goes by the item's class before its name: the class is what the item *is*,
+  the name is what someone called it.
+- **Testability constrains design.** The unit-test source set has no Minecraft on its classpath, so
+  the decision logic had to be pure to be testable at all. That pushed the ordering into
+  `ModClassifier` and the class predicates into a holder nested class — a lambda written directly in
+  `IngredientCategory` compiles to a method *on that class*, so merely loading the enum would then
+  have required Minecraft present.
 
 ## License
 
