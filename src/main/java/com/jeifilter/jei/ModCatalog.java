@@ -12,6 +12,7 @@ import java.util.TreeMap;
 
 import org.slf4j.Logger;
 
+import com.jeifilter.filter.ModAttribution;
 import com.jeifilter.filter.ModEntry;
 import com.mojang.logging.LogUtils;
 
@@ -154,16 +155,22 @@ final class ModCatalog {
 		}
 	}
 
+	/**
+	 * Which mod an ingredient belongs to, using JEI's own attribution.
+	 *
+	 * <p>The precedence rule lives in {@link ModAttribution} so it is unit tested; this method just
+	 * supplies the two inputs. Reading the registry namespace directly was the bug that made modded
+	 * potions and enchanted books count as {@code minecraft}: their registry names really are
+	 * {@code minecraft:potion} and {@code minecraft:enchanted_book}, and only the creator-mod-id
+	 * lookup identifies the mod that actually added them.
+	 */
 	private static String modIdOf(IIngredientHelper<Object> helper, Object ingredient) {
 		try {
 			if (!helper.isValidIngredient(ingredient)) {
 				return null;
 			}
-			net.minecraft.resources.ResourceLocation location = helper.getResourceLocation(ingredient);
-			if (location == null || location.getNamespace().isEmpty()) {
-				return null;
-			}
-			return location.getNamespace();
+			return ModAttribution.attribute(ingredient, helper::getDisplayModId,
+				value -> helper.getResourceLocation(value).getNamespace());
 		} catch (RuntimeException e) {
 			// A single bad ingredient must not take the whole catalog down.
 			return null;

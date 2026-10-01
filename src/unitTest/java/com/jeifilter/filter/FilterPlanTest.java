@@ -90,8 +90,9 @@ class FilterPlanTest {
 
 	@Test
 	@DisplayName("a dropped mod is unhidden but stays ticked; a mod still in JEI is hidden")
-	void droppedModIsUnhiddenRenamed() {
-		// "create" is ticked and was hidden, but JEI no longer lists it.
+	void droppedModIsUnhidden() {
+		// "create" is ticked and was hidden, but JEI no longer lists it. It must be released, not
+		// left hidden behind JEI's back.
 		FilterOptions options = FilterOptions.EMPTY.withToggled("create");
 
 		FilterOptions.FilterPlan plan = options.plan(Set.of("create"), List.of("minecraft", "mekanism"));

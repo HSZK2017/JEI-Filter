@@ -154,8 +154,8 @@ public final class FilterOptions {
 	 * must be told about.
 	 *
 	 * <p>Unhiding the stale mods comes first so that a mod which moves between "should be hidden" and
-	 * "should be visible" is never left hidden by an earlier call, and mods that are no longer in
-	 * {@code loadedModIds} (JEI dropped them) are still released.
+	 * "should be visible" is never left hidden by an earlier call, and a mod JEI no longer reports is
+	 * released rather than left hidden behind JEI's back.
 	 *
 	 * <p>This is a pure function of the selection so the hide/unhide decision can be unit tested:
 	 * getting {@code visible} backwards here produces a filter that does exactly the opposite of its

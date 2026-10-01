@@ -53,10 +53,16 @@ Delete that file (or untick everything) to get back to a stock JEI.
 - **Every ingredient type is filtered, not just items.** JEI's list is made of separate ingredient
   types (items, Forge fluids, and anything another mod registers). `ModCatalog` walks
   `IIngredientManager#getRegisteredIngredientTypes()`, reads `getAllIngredients` for each, and
-  attributes every ingredient to a mod through the namespace of its
-  `IIngredientHelper#getResourceLocation`. That is what makes "hide this mod" cover its fluids and
+  attributes every ingredient to a mod. That is what makes "hide this mod" cover its fluids and
   custom ingredients too, and it is why a whitelist that keeps only `minecraft` leaves no fluid
   behind.
+- **Attribution follows JEI, not the registry name.** `ModAttribution` asks for the ingredient's
+  *creator* mod id first (JEI's `IIngredientHelper#getDisplayModId`, which for an `ItemStack` is
+  Forge's `Item#getCreatorModId`) and only falls back to the namespace of the registry name. This
+  matters more than it looks: a modded potion is still registered as `minecraft:potion` and a modded
+  enchanted book as `minecraft:enchanted_book`, so a namespace-only rule files both under
+  `minecraft` and "hide minecraft" leaves exactly those items on screen. `ModAttributionTest` pins
+  the precedence.
 - **The mod list** is the aggregation of that catalog: one row per mod, with the count of everything
   that mod contributes across all ingredient types, and the display name from JEI's `IModIdHelper`.
 - **Hiding goes through `JeiVisibilityBridge`**, which picks the API the running JEI actually has.
@@ -82,6 +88,13 @@ Delete that file (or untick everything) to get back to a stock JEI.
   tooltip switches to `Filtering N mods (M items hidden)`.
 - **A partial ingredient list is never applied.** Ingredient lookups do not have a "finished
   loading" signal, so `rebuildCatalog` refuses a catalog that is missing mods the previous one had.
+- **On JEI older than 15.55.0 the catalog is never re-read while a filter is active.** That route
+  hides by taking ingredients *out* of JEI's list, so re-reading it would return the filtered list,
+  conclude the hidden mods are simply absent, and unhide them again — the "the items came back after
+  a moment" bug. There, an ingredient change only marks the catalog stale, and it is re-read at a
+  deliberate moment (opening the menu, or changing the selection) through `refreshCatalogNow`, which
+  un-hides first so the list is complete while it is read. On JEI 15.55.0+ hiding is a visibility
+  flag, `getAllIngredients` still returns everything, and the catalog can simply be rebuilt.
   This matters in whitelist mode, where "not in the catalog" would otherwise mean "hidden" and mods
   could flicker out and back in while JEI is still loading.
 - **`applyNow` is re-entrancy guarded.** `removeIngredientsAtRuntime`/`addIngredientsAtRuntime`
@@ -203,9 +216,13 @@ On **JEI 15.20.0.129** (the `removeIngredientsAtRuntime` path, i.e. an older pac
 - No recursion and no crash. This path used to recurse until `StackOverflowError` because
   `addIngredientsAtRuntime` re-enters this mod's own ingredient listener; that is what the
   `applyingVisibility` guard in `applyNow`/`refreshFromIngredients` fixes.
+- A filter survives the ingredient-list changes that the hide itself causes, instead of the hidden
+  items being added back seconds later. That was the "other mods' items reappear" bug, and it is why
+  this route marks the catalog stale instead of rebuilding it.
 
-Not yet verified on 15.20: opening the menu by clicking, and that the grid visually empties (the
-dev instance for that check loads a single mod, so it was exercised on 15.62 instead).
+Not yet verified on 15.20 by the author: opening the menu by clicking, and that the grid visually
+empties (the dev instance for that check loads a single mod, so it was exercised on 15.62 instead).
+Reported working in a 324-mod pack by the user, which is where the multi-mod behaviour was observed.
 
 Known gaps:
 
@@ -226,6 +243,7 @@ src/main/java/com/jeifilter/
   jei/JeiFilterPlugin.java       IModPlugin: JEI runtime available / unavailable
   jei/JeiFilterService.java      filter state, mod catalog, hide/unhide driver, persistence
   jei/JeiVisibilityBridge.java   picks hideIngredients (15.55+) or removeIngredientsAtRuntime
+  filter/ModAttribution.java     creator-mod-id first, registry namespace as the fallback
   filter/FilterOptions.java      immutable selection + mode, JSON round trip, hide/unhide plan
   filter/FilterMode.java         blacklist / whitelist
   filter/ModEntry.java           one row of the menu

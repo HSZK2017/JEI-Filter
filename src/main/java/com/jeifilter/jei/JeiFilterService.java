@@ -70,6 +70,11 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 	private Set<String> hiddenModIds = Set.of();
 	/** True while this mod is itself telling JEI to hide or show ingredients. */
 	private boolean applyingVisibility;
+	/**
+	 * True when JEI's ingredient list changed in a way we could not safely re-read yet, because
+	 * hiding on this JEI version removes ingredients from that very list.
+	 */
+	private boolean catalogStale;
 	/** True once JEI's ingredient list has been read successfully at least once. */
 	private boolean ready = false;
 
@@ -92,7 +97,17 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		if (this.runtime != null && this.runtime != runtime) {
 			LOGGER.warn("jei_filter: JEI runtime was replaced without an unload notification; re-attaching");
 		}
+		// Everything derived from the previous runtime is void: JEI builds a new ingredient manager
+		// (and, on the older route, a new removed-ingredient set) on every start. Forgetting the old
+		// hidden set here also stops the "catalog looks incomplete" check below from comparing a
+		// fresh, still-loading catalog against the previous runtime's and rejecting it.
+		boolean sameRuntime = this.runtime == runtime;
 		this.runtime = runtime;
+		if (!sameRuntime) {
+			this.hiddenModIds = Set.of();
+			this.catalog = ModCatalog.EMPTY;
+		}
+		this.catalogStale = false;
 		this.configFile = configDir.resolve(FILE_NAME);
 		this.options = loadOptions();
 
@@ -116,6 +131,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		this.visibilityBridge = null;
 		this.ready = false;
 		this.hiddenModIds = Set.of();
+		this.catalogStale = false;
 	}
 
 	// ------------------------------------------------------------------
@@ -133,6 +149,7 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 
 	/** Every mod that currently has at least one ingredient in JEI, in display order. */
 	public List<ModEntry> modEntries() {
+		refreshCatalogIfStale();
 		return this.catalog.entries();
 	}
 
@@ -175,6 +192,8 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 			return;
 		}
 		this.options = newOptions;
+		// The catalog is what the hide/unhide plan is computed from, so it has to be current.
+		refreshCatalogIfStale();
 		// Apply immediately so the player sees each checkbox take effect in JEI right away,
 		// then persist it so the filter survives a restart.
 		applyNow();
@@ -231,6 +250,19 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 			return false;
 		}
 
+		// On a JEI whose hiding takes ingredients out of the list it reports, a catalog read while a
+		// filter is active is a filtered catalog. A shrunken one is therefore almost certainly an
+		// artefact of reading at the wrong moment, not a mod the player removed, and replacing the
+		// good catalog with it would lose track of which mods are currently hidden.
+		boolean hidesByRemoval = this.visibilityBridge != null && !this.visibilityBridge.hidesRecipeSlots();
+		if (hidesByRemoval && !this.hiddenModIds.isEmpty()
+			&& rebuilt.loadedModIds().size() < previous.size()) {
+			LOGGER.warn("jei_filter: refusing a catalog of {} mods while filtering with a previous catalog of {}; "
+					+ "it was read while ingredients were hidden",
+				rebuilt.loadedModIds().size(), previous.size());
+			return false;
+		}
+
 		this.catalog = rebuilt;
 		this.ready = true;
 		return true;
@@ -263,6 +295,8 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 			this.applyingVisibility = false;
 		}
 		this.hiddenModIds = plan.newHiddenSet();
+		LOGGER.info("jei_filter: hiding {} mods ({} ingredients) from JEI", this.hiddenModIds.size(),
+			countIngredients(this.hiddenModIds));
 	}
 
 	/**
@@ -296,18 +330,85 @@ public final class JeiFilterService implements IIngredientManager.IIngredientLis
 		refreshFromIngredients();
 	}
 
+	/**
+	 * JEI's ingredient list changed.
+	 *
+	 * <p>Re-applying immediately is only safe when reading JEI's list back gives a complete picture.
+	 * That holds on JEI 15.55.0+, where hiding is a visibility flag and {@code getAllIngredients}
+	 * still returns everything. It does <strong>not</strong> hold on older JEI, where the only
+	 * public route ({@code removeIngredientsAtRuntime}) actually takes the ingredients out of the
+	 * list: rebuilding then would read back the filtered list, conclude that the hidden mods are
+	 * simply not installed, and unhide them. That is exactly the "the items came back after a
+	 * moment" bug.
+	 *
+	 * <p>So on the older route the catalog is kept and only re-read at a deliberate point — when the
+	 * player opens the menu or changes the selection — via {@link #refreshCatalogIfStale()} and
+	 * {@link #refreshCatalogNow(String)}.
+	 */
 	private void refreshFromIngredients() {
 		if (this.applyingVisibility) {
-			// This change is our own doing; rebuilding and re-applying here would recurse.
+			// Our own change; JEI is echoing it back at us.
 			return;
 		}
 		IJeiRuntime currentRuntime = this.runtime;
 		if (currentRuntime == null) {
 			return;
 		}
+
+		if (this.visibilityBridge != null && !this.visibilityBridge.hidesRecipeSlots()) {
+			this.catalogStale = true;
+			return;
+		}
+
 		if (rebuildCatalog(currentRuntime.getIngredientManager(),
 			currentRuntime.getJeiHelpers().getModIdHelper())) {
 			applyNow();
+		}
+	}
+
+	private void refreshCatalogIfStale() {
+		if (this.catalogStale && !this.applyingVisibility) {
+			refreshCatalogNow("catalog was marked stale");
+		}
+	}
+
+	/**
+	 * Un-hides everything this mod hid, re-reads JEI's now-complete ingredient list, and re-applies
+	 * the selection. Used on the older JEI route, where the ingredient list cannot be read while a
+	 * filter is active.
+	 *
+	 * <p>The whole sequence holds {@code applyingVisibility}, which makes it atomic with respect to
+	 * {@link #applyNow} and to itself. That matters: this method both un-hides and re-hides, and if
+	 * an {@code applyNow} could interleave with it, the bookkeeping would be updated against a
+	 * half-applied state and the filter would end up hiding the wrong mods.
+	 *
+	 * @return true if the catalog was rebuilt
+	 */
+	public boolean refreshCatalogNow(String reason) {
+		IJeiRuntime currentRuntime = this.runtime;
+		JeiVisibilityBridge bridge = this.visibilityBridge;
+		if (currentRuntime == null || bridge == null || this.applyingVisibility) {
+			return false;
+		}
+
+		this.applyingVisibility = true;
+		try {
+			if (!this.hiddenModIds.isEmpty()) {
+				LOGGER.info("jei_filter: re-reading JEI's ingredients ({})", reason);
+				// Take our own hides back off first, so JEI's list is complete again while we read it.
+				bridge.setVisible(this.catalog.ingredientsOf(this.hiddenModIds), true);
+				this.hiddenModIds = Set.of();
+			}
+
+			if (!rebuildCatalog(currentRuntime.getIngredientManager(),
+				currentRuntime.getJeiHelpers().getModIdHelper())) {
+				return false;
+			}
+			this.catalogStale = false;
+			applyNow();
+			return true;
+		} finally {
+			this.applyingVisibility = false;
 		}
 	}
 
