@@ -8,7 +8,6 @@ import java.util.function.Predicate;
 
 import org.jetbrains.annotations.Nullable;
 
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ArrowItem;
 import net.minecraft.world.item.EnchantedBookItem;
 import net.minecraft.world.item.Item;
@@ -22,54 +21,62 @@ import net.minecraft.world.item.PotionItem;
  * twenty mods that each add potions is tedious to clean up mod by mod, and impossible to clean up
  * when the potions hide inside a mod whose other items you want.
  *
- * <h2>How an item is classified</h2>
+ * <h2>Classification is by class, and only by class</h2>
  *
- * <p>By its <strong>class</strong> first, and only then by its registry name. The class is the real
- * answer: mods that add potions subclass {@code PotionItem} and mods that add arrows subclass
- * {@code ArrowItem}, and those checks cover the base vanilla items too, because every potion in the
- * game <em>is</em> an instance of {@code PotionItem}. Verified against a 324-mod pack with
- * {@code javap}: {@code CustomPotionItem extends PotionItem}, {@code CustomSplashPotion extends
- * CustomPotionItem}, {@code ItemDragonArrow extends ArrowItem}, {@code ItemModArrow extends
- * ArrowItem}, {@code BurrowingArrowItem extends ArrowItem}, {@code BrewArrowItem extends ArrowItem}.
+ * <p>An item belongs to a category when it <strong>is an instance of</strong> that category's vanilla
+ * base type: {@code PotionItem}, {@code ArrowItem}, {@code EnchantedBookItem}. Nothing else is
+ * consulted — not the registry name, not the translation key, not the tooltip.
  *
- * <p>The registry name is the fallback, for items that are clearly one of these things but do not
- * subclass the base — goety's {@code undeath_potion} item extends plain {@code Item}. Relying on the
- * name alone would also be wrong: {@code tacz:potion_magazine} is a gun magazine and
- * {@code somemod:arrow_quiver} is a quiver, so the keyword has to be a whole trailing word.
+ * <p>This covers vanilla for free, because every potion in the game <em>is</em> a {@code PotionItem},
+ * and it covers mods properly because mods subclass the base. Verified with {@code javap} against a
+ * 324-mod pack:
  *
- * <p>The creator mod id is deliberately <em>not</em> used here — that is attribution, a separate axis
- * handled by {@link ModAttribution}.
+ * <pre>
+ *   soulslike-weaponry  CustomPotionItem     extends PotionItem
+ *   soulslike-weaponry  CustomSplashPotion   extends CustomPotionItem
+ *   iceandfire          ItemDragonArrow      extends ArrowItem
+ *   alexsmobs           ItemModArrow         extends ArrowItem
+ *   alexscaves          BurrowingArrowItem   extends ArrowItem
+ *   goety               BrewArrowItem        extends ArrowItem
+ * </pre>
  *
- * <p>The ordering lives in {@link ModClassifier}, which is free of Minecraft types so it can be unit
- * tested. The class predicates live in {@link ItemClassChecks} for the same reason: a lambda written
- * here would compile to a method on this enum, and merely loading the enum would then require
- * Minecraft — which the unit-test classpath does not have.
+ * <h2>Why there is no name matching</h2>
+ *
+ * <p>An earlier version ALSO matched the registry name, to catch items that are one of these things
+ * without subclassing the base. That is gone: a name is a guess, and in a real pack the guesses are
+ * wrong often enough to matter. Items whose names contain "potion" or "arrow" but which are not
+ * potions or arrows exist in quantity — a gun magazine, a quiver, an arrowhead, decorative potion
+ * blocks and bottles that are never drunk. Since hiding a category hides everything in it, every false
+ * positive silently removes something the player never chose to hide.
+ *
+ * <p>The cost is real and accepted: something that behaves like a potion but extends plain
+ * {@code Item} — goety's {@code undeath_potion} is one — is not a potion here and lands in
+ * {@link #MAIN}. That is the safe direction. An item that stays visible is a mild annoyance; an item
+ * that vanishes without being asked is a bug.
  */
 public enum IngredientCategory {
 	/**
 	 * Everything that is not one of the categories below: a mod's ordinary items, and every non-item
 	 * ingredient such as fluids. Always present, and it cannot be turned off by itself.
 	 */
-	MAIN("jei_filter.category.other", null),
+	MAIN("jei_filter.category.other"),
 
 	/** Potions, splash potions and lingering potions, by any mod. */
-	POTION("jei_filter.category.potion", "potion"),
+	POTION("jei_filter.category.potion"),
 
 	/** Arrows, including tipped, spectral and modded arrows. */
-	ARROW("jei_filter.category.arrow", "arrow"),
+	ARROW("jei_filter.category.arrow"),
 
 	/** Enchanted books, by any mod. */
-	ENCHANTED_BOOK("jei_filter.category.enchanted_book", "enchanted_book");
+	ENCHANTED_BOOK("jei_filter.category.enchanted_book");
 
 	/** The categories a player can tick, i.e. everything except {@link #MAIN}. */
 	public static final List<IngredientCategory> SELECTABLE = List.of(POTION, ARROW, ENCHANTED_BOOK);
 
 	private final String translationKey;
-	private final String keyword;
 
-	IngredientCategory(String translationKey, String keyword) {
+	IngredientCategory(String translationKey) {
 		this.translationKey = translationKey;
-		this.keyword = keyword;
 	}
 
 	/** The id used in the saved config; stable across renames of the enum constant. */
@@ -83,10 +90,10 @@ public enum IngredientCategory {
 
 	/** True for the categories a player may tick, as opposed to {@link #MAIN}. */
 	public boolean isSelectable() {
-		return this.keyword != null;
+		return this != MAIN;
 	}
 
-	/** True when this item is an instance of the category's base type. */
+	/** True when this item is an instance of the category's vanilla base type. */
 	public boolean isOfClass(Item item) {
 		Predicate<Item> check = ItemClassChecks.INSTANCE.get(this);
 		return check != null && check.test(item);
@@ -102,59 +109,29 @@ public enum IngredientCategory {
 	}
 
 	/**
-	 * The category an item belongs to, or {@link #MAIN} when none applies.
+	 * The category an item belongs to, or {@link #MAIN} when it is not an instance of any base type.
 	 *
-	 * <p>Class first, then registry name; the ordering lives in {@link ModClassifier} so it is unit
-	 * tested. A null item means the caller has no item (a fluid, or another mod's custom ingredient
-	 * type), and only the name rule can apply.
+	 * <p>A null item — a fluid, or another mod's custom ingredient type — is always {@link #MAIN},
+	 * because these categories are defined over items.
 	 */
-	public static IngredientCategory of(@Nullable Item item, @Nullable ResourceLocation name) {
-		return ModClassifier.attribute(item,
-			value -> candidate -> candidate.isOfClass(value),
-			value -> name == null ? null : name.getPath(),
-			SELECTABLE,
-			MAIN);
-	}
-
-	/** Convenience for callers that only have the item. */
 	public static IngredientCategory of(@Nullable Item item) {
-		return of(item, null);
-	}
-
-	/**
-	 * The name-based rule on its own, free of Minecraft types so it is unit tested directly.
-	 *
-	 * <p>Every pattern requires the keyword to be a whole trailing segment, so {@code splash_potion}
-	 * matches but {@code potion_magazine} does not.
-	 */
-	public static IngredientCategory classify(String path) {
-		return ModClassifier.classify(path, SELECTABLE, MAIN);
-	}
-
-	/** True when this category claims a registry path by name. */
-	public boolean matchesPath(String path) {
-		return switch (this) {
-			case POTION -> endsWithWord(path, "potion");
-			case ARROW -> endsWithWord(path, "arrow");
-			case ENCHANTED_BOOK -> path.equals("enchanted_book") || path.endsWith("_enchanted_book");
-			case MAIN -> false;
-		};
-	}
-
-	/**
-	 * True when {@code path} is {@code word} or ends with {@code _word}, so {@code splash_potion}
-	 * matches {@code potion} but {@code potion_magazine} does not.
-	 */
-	private static boolean endsWithWord(String path, String word) {
-		if (path.equals(word)) {
-			return true;
+		if (item != null) {
+			for (IngredientCategory category : SELECTABLE) {
+				if (category.isOfClass(item)) {
+					return category;
+				}
+			}
 		}
-		return path.length() > word.length() + 1 && path.endsWith("_" + word);
+		return MAIN;
 	}
 
 	/**
-	 * The class predicates, in a separate class on purpose: see the class comment. Resolved the first
-	 * time {@link IngredientCategory#isOfClass} runs, which only ever happens in a running game.
+	 * The class predicates, in a separate class on purpose.
+	 *
+	 * <p>A lambda written inside {@link IngredientCategory} compiles to a private method <em>on that
+	 * class</em>, so its constant pool would name {@code PotionItem} and merely loading the enum would
+	 * need Minecraft present. The unit tests run with no Minecraft at all, so the predicates live here
+	 * and are resolved only when {@link #isOfClass} is called — which only happens in a running game.
 	 */
 	private static final class ItemClassChecks {
 		private static final Map<IngredientCategory, Predicate<Item>> INSTANCE = build();

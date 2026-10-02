@@ -30,6 +30,14 @@ java {
 	withSourcesJar()
 }
 
+// Compile every Java source as UTF-8. Without this the compiler uses the platform default, which on a
+// Chinese Windows install is GBK: a source file containing a typographic dash or the zh_cn lang
+// string fails with "unmappable character" even though the file itself is valid UTF-8. That turns a
+// comment into a build failure, so it is pinned here rather than worked around per file.
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = 'UTF-8'
+}
+
 minecraft {
 	mappings channel: mapping_channel, version: mapping_version
 	copyIdeResources = true

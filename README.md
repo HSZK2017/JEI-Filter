@@ -128,10 +128,12 @@ are all read, and all of them held whole-mod keys, which are still whole-mod fac
   the precedence.
 - **The mod list** is the aggregation of that catalog: one row per mod, with the count of everything
   that mod contributes across all ingredient types, and the display name from JEI's `IModIdHelper`.
-- **Categories are decided by class, then by registry name.** `IngredientCategory` checks the item's
-  type first: `PotionItem`, `ArrowItem`, `EnchantedBookItem`. That is the authoritative answer and it
-  covers vanilla too, because every potion in the game *is* a `PotionItem`. It also covers modded
-  items properly — checked with `javap` against this pack:
+- **Categories are decided by class, and only by class.** `IngredientCategory` asks one question: is
+  the item an instance of `PotionItem`, `ArrowItem` or `EnchantedBookItem`? Nothing else is consulted —
+  not the registry name, not the translation key, not the tooltip.
+
+  That covers vanilla for free, because every potion in the game *is* a `PotionItem`, and it covers
+  mods because mods subclass the base. Checked with `javap` against this pack:
 
   | Mod | Class | Extends |
   |---|---|---|
@@ -141,14 +143,18 @@ are all read, and all of them held whole-mod keys, which are still whole-mod fac
   | alexsmobs | `ItemModArrow` | `ArrowItem` |
   | alexscaves | `BurrowingArrowItem` | `ArrowItem` |
   | goety | `BrewArrowItem` | `ArrowItem` |
-  | goety | `UndeathPotionItem` | `Item` ← only its name identifies it |
 
-  The registry name is the **fallback**, which is what catches that last one and any other item that
-  is one of these things without subclassing the base. The name has to be a whole trailing segment,
-  so `splash_potion` matches but `potion_magazine` does not — a rule that matched on `contains` would
-  sweep unrelated items into a category, and hiding a category hides everything in it.
-  `ModClassifier` owns the ordering (and is Minecraft-free so it can be tested), `ModClassifierTest`
-  pins it, and `IngredientCategory` supplies the real class predicates.
+  **There is deliberately no name matching.** An earlier version also matched the registry name, to
+  catch items that behave like one of these without subclassing the base. That was removed: a name is
+  a guess, and in a real pack the guesses are wrong often enough to matter. Items whose names contain
+  "potion" or "arrow" but which are not potions or arrows exist in quantity — a gun magazine, a quiver,
+  an arrowhead, decorative potion blocks and bottles that are never drunk. Hiding a category hides
+  everything in it, so every false positive silently removes something the player never chose to hide.
+
+  The cost is real and accepted: something that behaves like a potion but extends plain `Item` — goety's
+  `UndeathPotionItem` is one — is **not** a potion here and stays in `main`, so it is never swept into
+  the potion category. That is the safe direction. An item that stays visible is a mild annoyance; an
+  item that vanishes without being asked is a bug.
 - **Hiding is per ingredient, not per mod.** The plan is a set of ingredients, because that is the only
   unit that can express "every potion in the pack, but nothing else". `ModCatalog` indexes every
   ingredient by its registry name plus JEI's unique id (so two enchanted books with different
@@ -272,8 +278,8 @@ jei_filter: <n> ingredients are in no special category
 ```
 
 The `category` lines are the category rules reporting what they found. A category that finds nothing is
-omitted, and one whose count looks wrong means `IngredientCategory#matchesPath` is over- or
-under-matching — which is worth checking, because hiding a category hides everything in it.
+omitted, and one whose count looks wrong means the class checks are not catching what they should —
+which is worth checking, because hiding a category hides everything in it.
 
 and `logs/debug.log` contains one `Mixing ...` line per mixin:
 
@@ -385,7 +391,6 @@ src/main/java/com/jeifilter/
   jei/ModCatalog.java            every ingredient, grouped by mod and category, with both indexes
   jei/JeiVisibilityBridge.java   picks hideIngredients (15.55+) or removeIngredientsAtRuntime
   filter/IngredientCategory.java potion / arrow / enchanted_book, by item class then by name
-  filter/ModClassifier.java      which category wins, as a pure function (no Minecraft types)
   filter/ModAttribution.java     creator-mod-id first, registry namespace as the fallback
   filter/FilterOptions.java      the two-level selection, three-state reads, hide/unhide plan, JSON
   filter/ModEntry.java           one row of the menu, and its sort orders
@@ -401,7 +406,7 @@ src/main/resources/
   jei_filter.png                 mod logo
 src/unitTest/java/com/jeifilter/filter/
   FilterOptionsTest.java         both axes, three-state reads, master/sub syncing, plan, JSON
-  ModClassifierTest.java         class-before-name ordering, and what must *not* match by name
+  IngredientCategoryTest.java    the category contract (classification itself is checked with javap)
   ModAttributionTest.java        creator mod id vs registry namespace
   ModEntryTest.java              search matching and sort orders
 ```
@@ -412,7 +417,8 @@ src/unitTest/java/com/jeifilter/filter/
 - **The unit of filtering is a mod, or a category within a mod.** There is no way to hide one specific
   item; use JEI's own hide-item feature for that.
 - The categories are **potions, arrows and enchanted books**. Adding another means editing
-  `IngredientCategory` (the enum plus its `matchesPath` case) and adding a lang key — the rest of the
+  `IngredientCategory` (the enum constant plus its entry in the nested class-predicate map) and adding a
+  lang key — the rest of the
   mod picks it up from `SELECTABLE`.
 - A mod only appears in the menu once JEI is reporting ingredients for it, which happens when a world
   is loaded. The menu is empty on the title screen.
@@ -424,7 +430,7 @@ src/unitTest/java/com/jeifilter/filter/
 
 ## Development notes
 
-Six defects in this mod were only findable in a large pack, not in the single-mod dev instance. They
+Seven defects in this mod were only findable in a large pack, not in the single-mod dev instance. They
 are recorded here because each one is a trap worth recognising again:
 
 | Symptom | Cause |
@@ -435,8 +441,9 @@ are recorded here because each one is a trap worth recognising again:
 | Hidden items reappear seconds later on an older JEI | The catalog was re-read while the filter was applied, so it returned the *filtered* list and the hidden mods looked absent. |
 | Items reappear, then disappear again | A menu open rebuilt the catalog in the middle of a hide, so the hidden set was recomputed from a half-applied state. |
 | Hiding one category hid the whole mod | The plan worked in whole mods. A category is not expressible as a set of mods, so the unit had to become the ingredient. |
+| Items that were not potions or arrows were hidden with the category | Classification matched the registry name as a fallback. A name is a guess: `potion_magazine` is a magazine, `arrow_quiver` is a quiver. Removed; only class inheritance decides now. |
 
-Four lessons that generalise:
+Five lessons that generalise:
 
 - **A hide that "ran" is not a hide that "took".** On the older JEI route the ingredient list is the
   thing being modified, so reading it back after hiding returns the filtered list. The useful
@@ -449,15 +456,14 @@ Four lessons that generalise:
   and keeps a single source of truth. Any extra flag to remember "the category was turned off" would
   re-introduce the disagreement between what the boxes show and what the filter does.
 - **A classification rule that matches too much is worse than one that matches too little.** Hiding a
-  category hides everything in it, so `potion_magazine` being filed as a potion costs the player items
-  they never chose to hide. `ModClassifierTest` asserts the near-misses explicitly. The same reasoning
-  is why classification goes by the item's class before its name: the class is what the item *is*,
-  the name is what someone called it.
+  category hides everything in it, so one wrongly-classified item costs the player something they never
+  chose to hide. That is the whole argument for class-only classification: the class is what the item
+  *is*, the name is only what someone called it.
 - **Testability constrains design.** The unit-test source set has no Minecraft on its classpath, so
-  the decision logic had to be pure to be testable at all. That pushed the ordering into
-  `ModClassifier` and the class predicates into a holder nested class — a lambda written directly in
-  `IngredientCategory` compiles to a method *on that class*, so merely loading the enum would then
-  have required Minecraft present.
+  the decision logic had to be pure to be testable at all. That is why the class predicates live in a
+  holder nested class: a lambda written directly in `IngredientCategory` compiles to a method *on that
+  class*, so merely loading the enum would then have required Minecraft present — and every test in
+  the project would have failed to load.
 
 ## License
 

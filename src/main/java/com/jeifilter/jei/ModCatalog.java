@@ -227,18 +227,14 @@ final class ModCatalog {
 	}
 
 	/**
-	 * Which category an ingredient belongs to. Anything that is not an item is "main", because the
-	 * categories are defined over items.
-	 *
-	 * <p>The registry name is passed along as well: the class is the primary answer, and the name is
-	 * the fallback for items that are one of these things without subclassing the base — for example
-	 * goety's {@code undeath_potion} item extends plain {@code Item}.
+	 * Which category an ingredient belongs to, by the item's class alone. Anything that is not an item
+	 * is "main", because the categories are defined over items.
 	 */
 	private static IngredientCategory categoryOf(Object ingredient) {
 		if (!(ingredient instanceof ItemStack stack) || stack.isEmpty()) {
 			return IngredientCategory.MAIN;
 		}
-		return IngredientCategory.of(stack.getItem(), ForgeRegistries.ITEMS.getKey(stack.getItem()));
+		return IngredientCategory.of(stack.getItem());
 	}
 
 	private static ModEntry.Kind classify(String modId) {
